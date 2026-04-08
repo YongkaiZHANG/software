@@ -77,6 +77,9 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* Explicit input mode:
+     * room + sensor + interval + receiver endpoint (+ optional loops).
+     */
     if (parse_u16(argv[1], &data.room_id) != 0) {
         fprintf(stderr, "Invalid room ID: %s\n", argv[1]);
         print_help();
@@ -120,6 +123,10 @@ int main(int argc, char *argv[])
         seed_ts.tv_sec = time(NULL);
         seed_ts.tv_nsec = 0;
     }
+    /*
+     * Mix time + pid + ids to avoid identical random streams
+     * when multiple senders are started nearly simultaneously.
+     */
     seed = (long)seed_ts.tv_nsec
          ^ (long)seed_ts.tv_sec
          ^ (long)getpid()
@@ -166,6 +173,7 @@ int main(int argc, char *argv[])
         data.value = data.value + TEMP_DEV * ((drand48() - 0.5) / 10);
         time(&data.timestamp);
 
+        /* Must match connmgr receive order exactly. */
         bytes = sizeof(data.sensor_id);
         if (tcp_send(client, &data.sensor_id, &bytes) != TCP_NO_ERROR) {
             fprintf(

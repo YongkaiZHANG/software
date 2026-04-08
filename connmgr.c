@@ -17,17 +17,25 @@
 #error TIMEOUT not defined
 #endif
 
+/* One detached worker thread per active TCP sender connection. */
 typedef struct client_ctx {
     tcpsock_t *client;
     struct client_ctx *next;
 } client_ctx_t;
 
+/* In-memory copy of room_sensor.map entries (room -> sensor). */
 typedef struct {
     uint16_t room_id;
     sensor_id_t sensor_id;
 } sensor_map_entry_t;
 
 static sbuffer_t **shared_buffer = NULL;
+/*
+ * Protects shared runtime state:
+ * - client linked list and active client count
+ * - counters and last_data_timestamp
+ * - receiver raw data file append section
+ */
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static client_ctx_t *client_list = NULL;
 static int active_clients = 0;
@@ -66,6 +74,7 @@ static int load_sensor_map(void)
         return -1;
     }
 
+    /* Input format: <room_id> <sensor_id> per line. */
     while (fscanf(map_file, "%hu %hu", &room_id, &sensor_id) == 2) {
         if (count == capacity) {
             sensor_map_entry_t *resized;
@@ -99,6 +108,7 @@ static int load_sensor_map(void)
 
 static bool is_valid_sensor_pair(uint16_t room_id, sensor_id_t sensor_id)
 {
+    /* Linear scan is acceptable for this assignment-size map. */
     for (size_t i = 0; i < sensor_map_count; i++) {
         if (sensor_map_entries[i].room_id == room_id &&
             sensor_map_entries[i].sensor_id == sensor_id) {
@@ -110,6 +120,10 @@ static bool is_valid_sensor_pair(uint16_t room_id, sensor_id_t sensor_id)
 
 static void log_rejected_pair(uint16_t room_id, sensor_id_t sensor_id)
 {
+    /*
+     * Keep this independent from datamgr log handle:
+     * connmgr can reject a pair before it enters the shared buffer pipeline.
+     */
     FILE *log_file = fopen(FIFO_LOG, "a");
 
     if (log_file == NULL) return;
@@ -119,6 +133,7 @@ static void log_rejected_pair(uint16_t room_id, sensor_id_t sensor_id)
         room_id,
         sensor_id
     );
+    fflush(log_file);
     fclose(log_file);
 }
 
@@ -201,6 +216,7 @@ static void append_receiver_measurement(const sensor_data_t *data)
 {
     if (data == NULL) return;
 
+    /* Serialized append to avoid interleaved writes from multiple workers. */
     pthread_mutex_lock(&state_mutex);
     if (receiver_data_file != NULL) {
         fprintf(
@@ -235,6 +251,9 @@ static int receive_measurement(tcpsock_t *client, sensor_data_t *data)
     int bytes;
     int rc;
 
+    /* Wire format order must match sender:
+     * sensor_id -> room_id -> value -> timestamp.
+     */
     bytes = sizeof(data->sensor_id);
     rc = tcp_receive(client, &data->sensor_id, &bytes);
     if (rc != TCP_NO_ERROR) return rc;
@@ -268,6 +287,7 @@ static void *client_thread(void *arg)
     while (receive_measurement(ctx->client, &data) == TCP_NO_ERROR) {
         int insert_rc;
 
+        /* Reject invalid map pairs early and drop this connection. */
         if (!is_valid_sensor_pair(data.room_id, data.sensor_id)) {
             log_rejected_pair(data.room_id, data.sensor_id);
             update_rejected_stats();
@@ -393,6 +413,7 @@ void *connmgr_listen(sbuffer_t **sbuffer, int port, int timeout_seconds)
             time_t now = time(NULL);
             time_t last_data = get_last_data_timestamp();
 
+            /* Idle timeout is based on "last accepted data time", not connects. */
             if (now - last_data >= timeout_seconds) {
                 printf(
                     "Connection manager idle timeout reached: %d seconds without incoming data\n",
@@ -403,6 +424,7 @@ void *connmgr_listen(sbuffer_t **sbuffer, int port, int timeout_seconds)
         }
     }
 
+    /* Stop producing and wake consumers before waiting workers to drain. */
     shutdown_all_clients();
     sbuffer_close(*shared_buffer);
 

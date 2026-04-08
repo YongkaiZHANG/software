@@ -15,6 +15,7 @@
 
 static void pop_head_unsafe(sbuffer_t *buffer, sensor_data_t *data)
 {
+    /* Caller must hold buffer->mutex. */
     sbuffer_node_t *dummy = buffer->head;
 
     if (dummy == NULL) return;
@@ -70,6 +71,7 @@ int sbuffer_close(sbuffer_t *buffer)
 
     pthread_mutex_lock(&buffer->mutex);
     buffer->closed = true;
+    /* Wake both producers and consumers so blocked waits can exit cleanly. */
     pthread_cond_broadcast(&buffer->not_empty);
     pthread_cond_broadcast(&buffer->not_full);
     pthread_mutex_unlock(&buffer->mutex);
@@ -109,6 +111,7 @@ int sbuffer_remove(sbuffer_t *buffer, sensor_data_t *data)
     if (buffer == NULL || data == NULL) return SBUFFER_FAILURE;
 
     pthread_mutex_lock(&buffer->mutex);
+    /* Blocking consumer: wait for data unless producer side is closed. */
     while (buffer->size == 0 && !buffer->closed) {
         pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
     }
@@ -139,6 +142,7 @@ int sbuffer_insert(sbuffer_t *buffer, sensor_data_t *data)
     }
 
 #if SBUFFER_FULL_POLICY == SBUFFER_FULL_BLOCK
+    /* Backpressure mode: never drop, producer waits for free capacity. */
     while (buffer->size >= buffer->capacity && !buffer->closed) {
         pthread_cond_wait(&buffer->not_full, &buffer->mutex);
     }
@@ -147,12 +151,14 @@ int sbuffer_insert(sbuffer_t *buffer, sensor_data_t *data)
         return SBUFFER_FAILURE;
     }
 #elif SBUFFER_FULL_POLICY == SBUFFER_FULL_DROP_NEWEST
+    /* Keep old data, reject newest sample when queue is full. */
     if (buffer->size >= buffer->capacity) {
         buffer->dropped_count++;
         pthread_mutex_unlock(&buffer->mutex);
         return SBUFFER_DROPPED;
     }
 #elif SBUFFER_FULL_POLICY == SBUFFER_FULL_DROP_OLDEST
+    /* Keep throughput by discarding oldest queued sample. */
     if (buffer->size >= buffer->capacity) {
         pop_head_unsafe(buffer, NULL);
         buffer->size--;
@@ -178,6 +184,7 @@ int sbuffer_insert(sbuffer_t *buffer, sensor_data_t *data)
 
     buffer->size++;
     buffer->last_stamp = data->timestamp;
+    /* One waiting consumer is enough for one newly inserted item. */
     pthread_cond_signal(&buffer->not_empty);
     pthread_mutex_unlock(&buffer->mutex);
     return result;

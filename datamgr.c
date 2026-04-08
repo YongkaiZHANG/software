@@ -63,6 +63,7 @@ static void write_data_log(FILE *file, const sensor_data_t *sensor)
     const char *status = "WARMUP";
 
     if (file == NULL || sensor == NULL) return;
+    /* Before window is full, report warmup instead of normal/hot/cold. */
     if (sensor->sample_count >= RUN_AVG_LENGTH) {
         status = alert_state_to_text(sensor->alert_state);
     }
@@ -111,6 +112,7 @@ static int load_sensor_map(FILE *fp_sensor_map)
     list = dpl_create(element_copy, element_free, element_compare);
     if (list == NULL) return -1;
 
+    /* Map format: <room_id> <sensor_id>. */
     while (fscanf(fp_sensor_map, "%hu %hu", &room_id, &sensor_id) == 2) {
         sensor_data_t sensor = {0};
 
@@ -131,6 +133,7 @@ static void update_running_average(sensor_data_t *sensor, sensor_value_t new_val
     double total = 0;
     size_t window_size;
 
+    /* Fixed-size sliding window with oldest sample eviction. */
     if (sensor->sample_count < RUN_AVG_LENGTH) {
         sensor->temperatures[sensor->sample_count] = new_value;
         sensor->sample_count++;
@@ -238,6 +241,10 @@ void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
                 new_alert_state = ALERT_STATE_HOT;
             }
 
+            /*
+             * Log only state transitions to avoid alert spam:
+             * NORMAL->HOT/COLD, HOT/COLD->NORMAL.
+             */
             if (new_alert_state != sensor->alert_state) {
                 if (new_alert_state == ALERT_STATE_COLD) {
                     snprintf(
@@ -276,6 +283,7 @@ void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
         sensor->alert_state = new_alert_state;
         write_data_log(log_file, sensor);
         pending_data_lines++;
+        /* Periodic flush safeguard for long high-frequency runs. */
         if (log_file != NULL && pending_data_lines >= 128) {
             fflush(log_file);
             pending_data_lines = 0;

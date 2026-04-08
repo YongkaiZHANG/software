@@ -69,6 +69,7 @@ static void *connmgr_start(void *arg)
 {
     app_context_t *context = arg;
 
+    /* Producer side: network ingress -> shared sbuffer. */
     connmgr_listen(&context->buffer, context->port, context->timeout_seconds);
     return NULL;
 }
@@ -83,6 +84,7 @@ static void *datamgr_start(void *arg)
         return NULL;
     }
 
+    /* Consumer side: sbuffer -> running averages -> gateway.log. */
     datamgr_parse_sensor_sbuffer(context->buffer, map_file);
     fclose(map_file);
     return NULL;
@@ -110,12 +112,14 @@ int main(int argc, char *argv[])
         fclose(log_file);
     }
 
+    /* Start consumer first so queued data can be drained immediately. */
     if (pthread_create(&datamgr_thread, NULL, datamgr_start, &context) != 0) {
         perror("pthread_create");
         sbuffer_free(&context.buffer);
         return EXIT_FAILURE;
     }
 
+    /* Then start producer side (TCP listener). */
     if (pthread_create(&connmgr_thread, NULL, connmgr_start, &context) != 0) {
         perror("pthread_create");
         pthread_join(datamgr_thread, NULL);
