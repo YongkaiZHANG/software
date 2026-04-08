@@ -1,0 +1,12 @@
+*.o
+*.so
+
+sensor_gateway
+sensor_node
+file_creator
+
+gateway.log
+sensor_data_recv.txt
+Sensor.db-journal
+
+final.zip
