@@ -1,265 +1,208 @@
-/**
- * \author Yongkai Zhang
- */
-
-#define _GNU_SOURCE
-#include "connmgr.h"
+#include <errno.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <sys/select.h>
+#include <sys/types.h>
 #include <unistd.h>
-#include <inttypes.h>
-#include <poll.h>
-#include <string.h>
+#include "config.h"
+#include "connmgr.h"
+#include "lib/tcpsock.h"
+#include "sbuffer.h"
 
 #ifndef TIMEOUT
-#define TIMEOUT
-#error TIMEOUT not specified!(in seconds)
+#error TIMEOUT not defined
 #endif
 
-typedef struct pollfd mypollfd;
+typedef struct {
+    tcpsock_t *client;
+} client_ctx_t;
 
-// Define the client data structure here
-typedef struct
+static sbuffer_t **shared_buffer = NULL;
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int active_clients = 0;
+static unsigned long long total_received = 0;
+static unsigned long long total_dropped = 0;
+
+static void reset_runtime_stats(void)
 {
-    bool is_new;
-    mypollfd fds;
-    time_t last_record;
-    tcpsock_t *sock_ptr;
-    uint16_t sensor_id;
-} tcp_poll_t;
+    pthread_mutex_lock(&state_mutex);
+    active_clients = 0;
+    total_received = 0;
+    total_dropped = 0;
+    pthread_mutex_unlock(&state_mutex);
+}
 
-dplist_t *connections = NULL;
-
-// dplist element free function for the client_t struct
-void client_free(void **element)
+static void update_active_clients(int delta)
 {
-    if (element != NULL && *element != NULL)
-    {
-        // tcp_poll_t *client = *(tcp_poll_t **)element;
-        // tcp_close(&client->sock_ptr); // Close the socket
-        free(*element);
-        *element = NULL;
+    pthread_mutex_lock(&state_mutex);
+    active_clients += delta;
+    pthread_mutex_unlock(&state_mutex);
+}
+
+static int get_active_clients(void)
+{
+    int count;
+
+    pthread_mutex_lock(&state_mutex);
+    count = active_clients;
+    pthread_mutex_unlock(&state_mutex);
+    return count;
+}
+
+static void update_receive_stats(bool dropped)
+{
+    pthread_mutex_lock(&state_mutex);
+    total_received++;
+    if (dropped) total_dropped++;
+    pthread_mutex_unlock(&state_mutex);
+}
+
+static int receive_measurement(tcpsock_t *client, sensor_data_t *data)
+{
+    int bytes;
+    int rc;
+
+    bytes = sizeof(data->sensor_id);
+    rc = tcp_receive(client, &data->sensor_id, &bytes);
+    if (rc != TCP_NO_ERROR) return rc;
+
+    bytes = sizeof(data->value);
+    rc = tcp_receive(client, &data->value, &bytes);
+    if (rc != TCP_NO_ERROR) return rc;
+
+    bytes = sizeof(data->timestamp);
+    rc = tcp_receive(client, &data->timestamp, &bytes);
+    if (rc != TCP_NO_ERROR) return rc;
+
+    data->room_id = 0;
+    data->RUN_AVG = 0;
+    data->sample_count = 0;
+    data->alert_state = 0;
+    for (size_t i = 0; i < RUN_AVG_LENGTH; i++) {
+        data->temperatures[i] = 0;
     }
+    return TCP_NO_ERROR;
 }
 
-// dplist element compare function for the client_t struct
-int client_compare(void *element1, void *element2)
+static void *client_thread(void *arg)
 {
-    tcp_poll_t *client1 = (tcp_poll_t *)element1;
-    tcp_poll_t *client2 = (tcp_poll_t *)element2;
-    return ((((tcp_poll_t *)client1)->sensor_id < ((tcp_poll_t *)client2)->sensor_id) ? -1 : (((tcp_poll_t *)client1)->sensor_id == ((tcp_poll_t *)client2)->sensor_id) ? 0
-                                                                                                                                                                        : 1);
+    client_ctx_t *ctx = arg;
+    tcpsock_t *client = ctx->client;
+    sensor_data_t data;
+
+    free(ctx);
+
+    while (receive_measurement(client, &data) == TCP_NO_ERROR) {
+        int insert_rc = sbuffer_insert(*shared_buffer, &data);
+
+        if (insert_rc == SBUFFER_FAILURE) break;
+        update_receive_stats(insert_rc == SBUFFER_DROPPED);
+    }
+
+    tcp_close(&client);
+    update_active_clients(-1);
+    return NULL;
 }
 
-// dplist element copy function for the client_t struct
-void *client_copy(void *element)
+void *connmgr_listen(sbuffer_t **sbuffer, int port, int timeout_seconds)
 {
-    tcp_poll_t *client = (tcp_poll_t *)element;
-    tcp_poll_t *new_client = (tcp_poll_t *)malloc(sizeof(tcp_poll_t));
-    new_client->sock_ptr = client->sock_ptr;
-    new_client->sensor_id = client->sensor_id;
-    new_client->fds = client->fds;
-    new_client->is_new = client->is_new;
-    new_client->last_record = client->last_record;
-    return new_client;
-}
-
-void connmgr_listens(sbuffer_t *buffer, int port, pthread_mutex_t *pipe_mutex, int *pipe_fd, int *database_fail)
-{
-    // Create the server socket
-    char *log_message; // for send massage to child
     tcpsock_t *server = NULL;
-    tcp_poll_t *server_poll = (tcp_poll_t *)malloc(sizeof(tcp_poll_t));
-    mypollfd severfd;
-    static mypollfd *pollfds = NULL;               // here for dynamic alloc for poll_fds
-    static sensor_ts_t *client_last_record = NULL; // here for timeout check
-    sensor_data_t *sensor_data = (sensor_data_t *)malloc(sizeof(sensor_data_t));
-    int status = tcp_passive_open(&server, port); // open the server
-    if (status != TCP_NO_ERROR)
-    {
-        asprintf(&log_message, "No such server port defined.\n");
-        send_into_pipe(pipe_mutex, pipe_fd, log_message);
-        printf("Error: Failed to create server socket.\n");
-        exit(EXIT_FAILURE);
+    int server_sd;
+
+    if (sbuffer == NULL || *sbuffer == NULL) return NULL;
+    if (port <= 0) return NULL;
+    if (timeout_seconds <= 0) timeout_seconds = TIMEOUT;
+
+    shared_buffer = sbuffer;
+    reset_runtime_stats();
+
+    if (tcp_passive_open(&server, port) != TCP_NO_ERROR) {
+        fprintf(stderr, "Unable to start TCP server on port %d\n", port);
+        sbuffer_close(*shared_buffer);
+        return NULL;
     }
-    status = tcp_get_sd(server, &(severfd.fd)); // get the sd from the socket to bond
-    if (status != TCP_NO_ERROR)
-    {
-        printf("socket not yet bonded.\n");
-        exit(EXIT_FAILURE);
+
+    if (tcp_get_sd(server, &server_sd) != TCP_NO_ERROR) {
+        tcp_close(&server);
+        sbuffer_close(*shared_buffer);
+        return NULL;
     }
-    // initialize the server
-    severfd.events = POLLIN;
-    server_poll->sock_ptr = server;
-    server_poll->last_record = (sensor_ts_t)time(NULL);
-    server_poll->fds = severfd;
-    server_poll->sensor_id = 0;
-    server_poll->is_new = true;
 
-    // Initialize the connections list
-    connections = dpl_create(&client_copy, &client_free, &client_compare);
-    connections = dpl_insert_at_index(connections, (void *)server_poll, 0, true);
+    printf(
+        "Connection manager listening on port %d (idle timeout: %d sec)\n",
+        port,
+        timeout_seconds
+    );
 
-    tcpsock_t *client_socket = NULL;
-    mypollfd clientfd;
-    pollfds = (mypollfd *)malloc(sizeof(mypollfd)); // Initially array for 1 element
-    client_last_record = (sensor_ts_t *)malloc(sizeof(sensor_ts_t));
-    // // Initialize the connections list
-    pollfds[0].fd = -1;        // Set an invalid value initially
-    pollfds[0].events = 0;     // No events initially
-    client_last_record[0] = 0; // No effective timestamp
-    pollfds[0] = severfd;      // put the server fds in the first element of the array
-    client_last_record[0] = time(NULL);
-    int res;
-    printf("start to have data\n");
-    // in this loop, it always listen to the client coming until there is no client coming for 10s
-    while ((res = poll(pollfds, dpl_size(connections), TIMEOUT * 1000))) // this sentence is always listen to any change of the socket bonded with the server(include the server and client)
-    {
-        // everytime to check if there is new connection coming if there are new connection then add
-        // it into the socket dplist.
-        if (pollfds[0].revents == POLLIN)
-        {
-            if (tcp_wait_for_connection(server, &client_socket) != TCP_NO_ERROR)
-            {
-                printf("the connect with client is not get.\n");
-                exit(EXIT_FAILURE);
-            }
-            else
-            {
-                // Add the new client to the connections list
-                if (tcp_get_sd(client_socket, &(clientfd.fd)) != TCP_NO_ERROR)
-                {
-                    printf("the socket of client is not bond yet.\n");
-                    exit(EXIT_FAILURE);
-                }
-                else
-                {
-                    tcp_poll_t *client_poll = (tcp_poll_t *)malloc(sizeof(tcp_poll_t));
-                    // get initial the client poll information
-                    clientfd.events = POLLIN | POLLRDHUP;
-                    client_poll->last_record = (sensor_ts_t)time(NULL);
-                    client_poll->sock_ptr = client_socket;
-                    client_poll->fds = clientfd;
-                    client_poll->is_new = true;
-                    client_poll->sensor_id = 0;
-                    connections = dpl_insert_at_index(connections, client_poll, dpl_size(connections), true);
-                    int conn_size =dpl_size(connections);
-                    mypollfd *new_pollfds = (mypollfd *)realloc(pollfds, sizeof(mypollfd) * (conn_size+1));
-                    sensor_ts_t *new_client_last_record = (sensor_ts_t *)realloc(client_last_record, sizeof(sensor_ts_t) * (conn_size+1));
+    while (1) {
+        fd_set readfds;
+        struct timeval accept_timeout;
+        int ready;
+        tcpsock_t *client = NULL;
+        client_ctx_t *ctx;
+        pthread_t worker;
 
-                    if (new_pollfds == NULL || new_client_last_record == NULL)
-                    {
-                        // Handle allocation failure
-                        // Maybe free the old memory and return an error
-                    }
-                    else
-                    {
-                        pollfds = new_pollfds;
-                        client_last_record = new_client_last_record;
+        FD_ZERO(&readfds);
+        FD_SET(server_sd, &readfds);
+        accept_timeout.tv_sec = timeout_seconds;
+        accept_timeout.tv_usec = 0;
 
-                        // Initialize newly added memory, if any
-                        for (int i = 1; i <= conn_size; i++)
-                        {
-                            pollfds[i].fd = -1;
-                            pollfds[i].events = 0;
-                            client_last_record[i] = 0;
-                        }
-                    }
-                    free(client_poll);
-                }
-            }
+        ready = select(server_sd + 1, &readfds, NULL, NULL, &accept_timeout);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            perror("select");
+            break;
         }
-        tcp_poll_t *temp_poll = NULL;
-        // get all the fds in to the array (every time when the fds get refreshed it will pass it to the array )
-        for (int i = 1; i < dpl_size(connections); i++)
-        {
-            temp_poll = (tcp_poll_t *)dpl_get_element_at_index(connections, i);
-            pollfds[i] = temp_poll->fds;
-            client_last_record[i] = temp_poll->last_record;
+        if (ready == 0) break;
+
+        if (tcp_wait_for_connection(server, &client) != TCP_NO_ERROR) {
+            fprintf(stderr, "Failed to accept an incoming connection\n");
+            continue;
         }
-        // go through the dplist to print the poll information(the data get from the client, the index 0 is the server, and index 1 is the client)
-        tcp_poll_t *pollinform = NULL;
-        for (int i = 1; i < dpl_size(connections); i++)
-        {
-            pollinform = (tcp_poll_t *)dpl_get_element_at_index(connections, i);
-            int back = poll(&pollfds[i], 2, 0);
-            // which means there is new information coming
-            if (back)
-            {
-                if (pollfds[i].revents == POLLIN)
-                {
-                    // get the sensor id
-                    int result;
-                    int byte = sizeof(sensor_data->id);
-                    result = tcp_receive(pollinform->sock_ptr, (void *)&(sensor_data->id), &byte);
-                    pollinform->sensor_id = sensor_data->id;
-                    // get the sensor value
-                    byte = sizeof(sensor_data->value);
-                    result = tcp_receive(pollinform->sock_ptr, (void *)&(sensor_data->value), &byte);
-                    // get the timestamp
-                    byte = sizeof(sensor_data->ts);
-                    result = tcp_receive(pollinform->sock_ptr, (void *)&(sensor_data->ts), &byte);
-                    if ((result == TCP_NO_ERROR) && byte)
-                    {
-                        printf("sensor id = %" PRIu16 " - temperature = %g - timestamp = %ld\n", sensor_data->id, sensor_data->value,
-                               (long int)sensor_data->ts);
-                        sbuffer_insert(buffer, sensor_data, database_fail);
-                    }
-                    // to check if is new node
-                    if (pollinform->is_new)
-                    {
-                        printf("new sensor node %d is open\n", pollinform->sensor_id);
-                        // Send log message to child process
-                        asprintf(&log_message, "new sensor node %d is open\n", pollinform->sensor_id);
-                        send_into_pipe(pipe_mutex, pipe_fd, log_message);
-                        pollinform->is_new = false; // set the is new to false
-                    }
-                    // reset the node timestamp
-                    pollinform->last_record = time(NULL);
-                }
-                // if the connection is closed handle it
-                if (pollfds[i].revents & POLLRDHUP)
-                {
-                    // Send log message to child process
-                    asprintf(&log_message, "the sensor node id: %d is closed connection\n", pollinform->sensor_id);
-                    send_into_pipe(pipe_mutex, pipe_fd, log_message);
-                    printf("the sensor node id: %d is closed connection\n", pollinform->sensor_id);
-                    // if the connection is closed then delete the node from the dplist
-                    // close the tcpconncetion
-                    tcp_close(&(pollinform->sock_ptr));
-                    dpl_remove_at_index(connections, i, true);
-                }
-            }
-            // here if there is a timeout will be get if poll don't get any change of this client
-            if (difftime((sensor_ts_t)time(NULL), client_last_record[i]) > TIMEOUT)
-            { // we should check if this sensor is active in timeout period
-                // send to child
-                asprintf(&log_message, "the sensor node id: %d is closed connection\n", pollinform->sensor_id);
-                send_into_pipe(pipe_mutex, pipe_fd, log_message);
-                printf("this sensor node id:%d is timeout\n", pollinform->sensor_id);
-                tcp_close(&(pollinform->sock_ptr));
-                dpl_remove_at_index(connections, i, true);
-            }
+
+        ctx = malloc(sizeof(*ctx));
+        if (ctx == NULL) {
+            tcp_close(&client);
+            perror("malloc");
+            break;
         }
+        ctx->client = client;
+        update_active_clients(1);
+
+        if (pthread_create(&worker, NULL, client_thread, ctx) != 0) {
+            perror("pthread_create");
+            update_active_clients(-1);
+            tcp_close(&client);
+            free(ctx);
+            break;
+        }
+
+        pthread_detach(worker);
     }
-    // close the connection after the timeout of the server
-    printf("the server is not active, it closed\n");
-    tcp_close(&server);
-    dpl_free(&connections, true);
-    free(server_poll);
-    free(sensor_data);
-    free(pollfds);
-    free(client_last_record);
+
+    while (get_active_clients() > 0) {
+        usleep(100000);
+    }
+
+    if (server != NULL) {
+        tcp_close(&server);
+    }
+    sbuffer_close(*shared_buffer);
+
+    pthread_mutex_lock(&state_mutex);
+    printf(
+        "Connection manager stopped. total received=%llu, dropped=%llu (queue dropped=%llu)\n",
+        total_received,
+        total_dropped,
+        sbuffer_get_drop_count(*shared_buffer)
+    );
+    pthread_mutex_unlock(&state_mutex);
+    return NULL;
 }
 
-void connmgr_free()
+void connmgr_free(tcpsock_t *point)
 {
-    // Close all client connections and free the memory used by client connections
-    while (dpl_size(connections) > 0)
-    {
-        tcp_poll_t *client = (tcp_poll_t *)dpl_get_element_at_index(connections, 0);
-        tcp_close(&(client->sock_ptr));
-        dpl_remove_at_index(connections, 0, true);
-    }
-    // Free the memory used by the connections list
-    dpl_free(&connections, true);
+    tcp_close(&point);
 }

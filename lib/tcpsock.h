@@ -18,6 +18,16 @@
 #define MAX_PENDING 10
 
 typedef struct tcpsock tcpsock_t;
+/**
+ * Structure for holding the TCP socket information
+ */
+struct tcpsock {
+    long cookie;        /**< if the socket is bound, cookie should be equal to MAGIC_COOKIE */
+    // remark: the use of magic cookies doesn't guarantee a 'bullet proof' test
+    int sd;             /**< socket descriptor */
+    char *ip_addr;      /**< socket IP address */
+    int port;           /**< socket port number */
+};
 
 /**
  * Creates a new socket and opens this socket in 'passive listening mode' (waiting for an active connection setup request)

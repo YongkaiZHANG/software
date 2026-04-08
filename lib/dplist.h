@@ -8,7 +8,7 @@
 typedef void *element_ptr_t;
 // typedef enum{
 //  false,true
-// }bool;// or use C99 #include <stdbool.h>
+// }Bool;// or use C99 #include <stdbool.h>
 
 
 /**
@@ -142,18 +142,6 @@ dplist_node_t *dpl_get_first_reference(dplist_t *list);
  */
 dplist_node_t *dpl_get_last_reference(dplist_t *list);
 
-/** Returns the index of the list node in the list with reference 'reference'.
- * - the first list node has index 0.
- * - If the list is empty, -1 is returned.
- * - If 'list' is is NULL, -1 is returned.
- * - If 'reference' is NULL, -1 returned.
- * - If 'reference' is not an existing reference in the list, -1 is returned.
- * \param list a pointer to the list
- * \param reference a pointer to a certain node in the list
- * \return the index of the given reference in the list
- */
-int dpl_get_index_of_reference(dplist_t *list, const dplist_node_t *reference);
-
 /** Returns a reference to the next list node of the list node with reference 'reference' in the list.
  * - If the list is empty, NULL is returned.
  * - If 'list' is is NULL, NULL is returned.
@@ -186,6 +174,17 @@ dplist_node_t *dpl_get_previous_reference(dplist_t *list, dplist_node_t *referen
  */
 dplist_node_t *dpl_get_reference_of_element(dplist_t *list, void *element);
 
+/** Returns the index of the list node in the list with reference 'reference'.
+ * - the first list node has index 0.
+ * - If the list is empty, -1 is returned.
+ * - If 'list' is is NULL, -1 is returned.
+ * - If 'reference' is NULL, -1 returned.
+ * - If 'reference' is not an existing reference in the list, -1 is returned.
+ * \param list a pointer to the list
+ * \param reference a pointer to a certain node in the list
+ * \return the index of the given reference in the list
+ */
+int dpl_get_index_of_reference(dplist_t *list, dplist_node_t *reference);
 
 /** Inserts a new list node containing an 'element' in the list at position 'reference'.
  * - If 'list' is is NULL, NULL is returned.

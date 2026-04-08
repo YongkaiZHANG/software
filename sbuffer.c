@@ -2,171 +2,225 @@
  * \author Yongkai Zhang
  */
 
-#define _GNU_SOURCE
-#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "config.h"
 #include "sbuffer.h"
-#include <string.h>
+
+#if (SBUFFER_FULL_POLICY != SBUFFER_FULL_BLOCK) && \
+    (SBUFFER_FULL_POLICY != SBUFFER_FULL_DROP_NEWEST) && \
+    (SBUFFER_FULL_POLICY != SBUFFER_FULL_DROP_OLDEST)
+#error Unsupported SBUFFER_FULL_POLICY
+#endif
+
+static void pop_head_unsafe(sbuffer_t *buffer, sensor_data_t *data)
+{
+    sbuffer_node_t *dummy = buffer->head;
+
+    if (dummy == NULL) return;
+    if (data != NULL) {
+        *data = dummy->data;
+    }
+
+    buffer->head = dummy->next;
+    if (buffer->head == NULL) {
+        buffer->tail = NULL;
+    }
+    free(dummy);
+}
 
 int sbuffer_init(sbuffer_t **buffer)
 {
-    *buffer = (sbuffer_t *)malloc(sizeof(sbuffer_t));
-    if (*buffer == NULL)
-    {
-        return SBUFFER_FAILURE;
-    }
+    *buffer = malloc(sizeof(sbuffer_t));
+    if (*buffer == NULL) return SBUFFER_FAILURE;
 
     (*buffer)->head = NULL;
     (*buffer)->tail = NULL;
-    pthread_rwlock_init(&(*buffer)->rwlock, NULL);
-     pthread_mutex_init(&(*buffer)->mutex, NULL);
+    (*buffer)->size = 0;
+    (*buffer)->capacity = SBUFFER_CAPACITY;
+    (*buffer)->closed = false;
+    (*buffer)->dropped_count = 0;
+    (*buffer)->last_stamp = 0;
+
+    if (pthread_mutex_init(&(*buffer)->mutex, NULL) != 0) {
+        free(*buffer);
+        *buffer = NULL;
+        return SBUFFER_FAILURE;
+    }
+    if (pthread_cond_init(&(*buffer)->not_empty, NULL) != 0) {
+        pthread_mutex_destroy(&(*buffer)->mutex);
+        free(*buffer);
+        *buffer = NULL;
+        return SBUFFER_FAILURE;
+    }
+    if (pthread_cond_init(&(*buffer)->not_full, NULL) != 0) {
+        pthread_cond_destroy(&(*buffer)->not_empty);
+        pthread_mutex_destroy(&(*buffer)->mutex);
+        free(*buffer);
+        *buffer = NULL;
+        return SBUFFER_FAILURE;
+    }
+
+    return SBUFFER_SUCCESS;
+}
+
+int sbuffer_close(sbuffer_t *buffer)
+{
+    if (buffer == NULL) return SBUFFER_FAILURE;
+
+    pthread_mutex_lock(&buffer->mutex);
+    buffer->closed = true;
+    pthread_cond_broadcast(&buffer->not_empty);
+    pthread_cond_broadcast(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
     return SBUFFER_SUCCESS;
 }
 
 int sbuffer_free(sbuffer_t **buffer)
 {
+    sbuffer_node_t *dummy;
 
-    if (*buffer == NULL)
-    {
+    if ((buffer == NULL) || (*buffer == NULL)) {
         return SBUFFER_FAILURE;
     }
 
-    sbuffer_node_t *current = (*buffer)->head;
-    while (current != NULL)
-    {
-        sbuffer_node_t *temp = current;
-        current = current->next;
-        free(temp);
+    sbuffer_close(*buffer);
+
+    pthread_mutex_lock(&(*buffer)->mutex);
+    while ((*buffer)->head != NULL) {
+        dummy = (*buffer)->head;
+        (*buffer)->head = (*buffer)->head->next;
+        free(dummy);
     }
-    pthread_rwlock_destroy(&(*buffer)->rwlock);
+    (*buffer)->tail = NULL;
+    (*buffer)->size = 0;
+    pthread_mutex_unlock(&(*buffer)->mutex);
+
+    pthread_cond_destroy(&(*buffer)->not_empty);
+    pthread_cond_destroy(&(*buffer)->not_full);
     pthread_mutex_destroy(&(*buffer)->mutex);
     free(*buffer);
     *buffer = NULL;
-
     return SBUFFER_SUCCESS;
 }
 
-int sbuffer_remove(sbuffer_t *buffer, sensor_data_t *data, int who_read, int* database_fail)
+int sbuffer_remove(sbuffer_t *buffer, sensor_data_t *data)
 {
-    //to check if the buffer not exsit or the data is not avaliable
-    if (buffer == NULL || data == NULL)
-    {
-        return SBUFFER_FAILURE;
-    }
-    //ro check if  database failed to let the remove not work so that the sbuffer can be deleted
-    if((*database_fail))
-    {
-        return SBUFFER_FAILURE;
-    }
-    //if the readers second time coming then just return, it will not work for the first coming
-    if (who_read == DATABASE_READ && buffer->head != NULL && buffer->head->database_read)
-    {
-        return SBUFFER_FAILURE;
-    }
-    if (who_read == DATAMGR_READ && buffer->head != NULL && buffer->head->datamgr_read)
-    {
-        return SBUFFER_FAILURE;
-    }
+    if (buffer == NULL || data == NULL) return SBUFFER_FAILURE;
 
-    //the first time when the readers coming
-    if (buffer->head == NULL)
-    {
-        // Wait until data is available in the buffer
-        return SBUFFER_FAILURE;
-    }
-    else
-    {
-        // Acquire the read lock
-        pthread_rwlock_wrlock(&buffer->rwlock);
-        // Create a copy of the data to be read by both readers
-        *data = buffer->head->data;
-        if (who_read == DATABASE_READ)
-        {
-            if (buffer->head->database_read == false)
-            {
-                buffer->head->database_read = true;
-                // If both readers have finished, delete the node
-                if (buffer->head->database_read && buffer->head->datamgr_read)
-                {
-                    sbuffer_node_t *temp = buffer->head;
-                    buffer->head = temp->next;
-                    free(temp);
-                }
-            }
-        }
-        else if (who_read == DATAMGR_READ)
-        {
-            if (buffer->head->datamgr_read == false)
-            {
-                buffer->head->datamgr_read = true;
-                // If both readers have finished, delete the node
-                if (buffer->head->database_read && buffer->head->datamgr_read)
-                {
-                    sbuffer_node_t *temp = buffer->head;
-                    buffer->head = temp->next;
-                    free(temp);
-                }
-            }
-        }
-
-        pthread_rwlock_unlock(&buffer->rwlock);
-
-        return SBUFFER_SUCCESS;
-    }
-}
-
-int sbuffer_insert(sbuffer_t *buffer, const sensor_data_t *data, int* database_fail)
-{
-    if (buffer == NULL || data == NULL)
-    {
-        return SBUFFER_FAILURE;
-    }
-    //to check if the the database fail, then prevent to insert in order to let the sbuffer free to accece resources
-    if((*database_fail))
-    {
-        return SBUFFER_FAILURE;
-    }
-
-    sbuffer_node_t *new_node = (sbuffer_node_t *)malloc(sizeof(sbuffer_node_t));
-    if (new_node == NULL)
-    {
-        return SBUFFER_FAILURE;
-    }
-
-    new_node->data = *data;
-    // to set the flag to flase when insert to make sure the node is read by both readers
-    new_node->database_read = false;
-    new_node->datamgr_read = false;
-    new_node->next = NULL;
-
-    pthread_rwlock_wrlock(&buffer->rwlock);
-
-    if (buffer->head == NULL) // the buffer is empty
-    {
-        buffer->head = new_node;
-        buffer->tail = new_node;
-    }
-    else
-    {
-        buffer->tail->next = new_node;
-        buffer->tail = new_node;
-    }
-
-    pthread_rwlock_unlock(&buffer->rwlock);
-    return SBUFFER_SUCCESS;
-}
-
-int sbuffer_is_empty(sbuffer_t *buffer)
-{
     pthread_mutex_lock(&buffer->mutex);
-    int is_empty = (buffer->head == NULL);
+    while (buffer->size == 0 && !buffer->closed) {
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+    }
+
+    if (buffer->size == 0 && buffer->closed) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return SBUFFER_CLOSED;
+    }
+
+    pop_head_unsafe(buffer, data);
+    buffer->size--;
+    pthread_cond_signal(&buffer->not_full);
     pthread_mutex_unlock(&buffer->mutex);
-    return is_empty;
+    return SBUFFER_SUCCESS;
 }
 
-void send_into_pipe(pthread_mutex_t *pipe_mutex, int *pipe_fd, char *pipe_info)
+int sbuffer_insert(sbuffer_t *buffer, sensor_data_t *data)
 {
-    pthread_mutex_lock(pipe_mutex);
-    write(*pipe_fd, pipe_info, strlen(pipe_info));
-    pthread_mutex_unlock(pipe_mutex);
-    free(pipe_info);
+    sbuffer_node_t *dummy;
+    int result = SBUFFER_SUCCESS;
+
+    if (buffer == NULL || data == NULL) return SBUFFER_FAILURE;
+
+    pthread_mutex_lock(&buffer->mutex);
+    if (buffer->closed) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return SBUFFER_FAILURE;
+    }
+
+#if SBUFFER_FULL_POLICY == SBUFFER_FULL_BLOCK
+    while (buffer->size >= buffer->capacity && !buffer->closed) {
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+    }
+    if (buffer->closed) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return SBUFFER_FAILURE;
+    }
+#elif SBUFFER_FULL_POLICY == SBUFFER_FULL_DROP_NEWEST
+    if (buffer->size >= buffer->capacity) {
+        buffer->dropped_count++;
+        pthread_mutex_unlock(&buffer->mutex);
+        return SBUFFER_DROPPED;
+    }
+#elif SBUFFER_FULL_POLICY == SBUFFER_FULL_DROP_OLDEST
+    if (buffer->size >= buffer->capacity) {
+        pop_head_unsafe(buffer, NULL);
+        buffer->size--;
+        buffer->dropped_count++;
+        result = SBUFFER_DROPPED;
+    }
+#endif
+
+    dummy = malloc(sizeof(sbuffer_node_t));
+    if (dummy == NULL) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return SBUFFER_FAILURE;
+    }
+    dummy->data = *data;
+    dummy->next = NULL;
+
+    if (buffer->tail == NULL) {
+        buffer->head = buffer->tail = dummy;
+    } else {
+        buffer->tail->next = dummy;
+        buffer->tail = dummy;
+    }
+
+    buffer->size++;
+    buffer->last_stamp = data->timestamp;
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+    return result;
+}
+
+unsigned long long sbuffer_get_drop_count(sbuffer_t *buffer)
+{
+    unsigned long long dropped;
+
+    if (buffer == NULL) return 0;
+
+    pthread_mutex_lock(&buffer->mutex);
+    dropped = buffer->dropped_count;
+    pthread_mutex_unlock(&buffer->mutex);
+    return dropped;
+}
+
+int sbuffer_getlength(sbuffer_t *buffer)
+{
+    int size;
+    if (buffer == NULL) return SBUFFER_FAILURE;
+
+    pthread_mutex_lock(&buffer->mutex);
+    size = (int)buffer->size;
+    pthread_mutex_unlock(&buffer->mutex);
+    return size;
+}
+
+void *sbuffer_getdataIndex(sbuffer_t *buffer, int index)
+{
+    sbuffer_node_t *dummy;
+    int count = 0;
+
+    if (buffer == NULL || index < 0) return NULL;
+
+    pthread_mutex_lock(&buffer->mutex);
+    for (dummy = buffer->head; dummy != NULL; dummy = dummy->next, count++) {
+        if (count == index) {
+            void *result = &dummy->data;
+            pthread_mutex_unlock(&buffer->mutex);
+            return result;
+        }
+    }
+    pthread_mutex_unlock(&buffer->mutex);
+    return NULL;
 }

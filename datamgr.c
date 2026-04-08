@@ -1,197 +1,274 @@
 /**
  * \author Yongkai Zhang
  */
-#define _GNU_SOURCE
-#include <stdlib.h>
+
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
-#include <assert.h>
-#include <unistd.h>
-#include <string.h>
-#include "lib/dplist.h"
+#include <stdlib.h>
+#include "config.h"
 #include "datamgr.h"
-#include <time.h>
-#include "sbuffer.h"
-/*
- * definition of error codes
- * */
 
-#ifdef DEBUG
-#define DEBUG_PRINTF(...)                                                                    \
-    do                                                                                       \
-    {                                                                                        \
-        fprintf(stderr, "\nIn %s - function %s at line %d: ", __FILE__, __func__, __LINE__); \
-        fprintf(stderr, __VA_ARGS__);                                                        \
-        fflush(stderr);                                                                      \
-    } while (0)
-#else
-#define DEBUG_PRINTF(...) (void)0
-#endif
+static dplist_t *list = NULL;
+static int listen_port = 0;
 
-#define DPLIST_ERR_HANDLER(condition, err_code)   \
-    do                                            \
-    {                                             \
-        if ((condition))                          \
-            DEBUG_PRINTF(#condition " failed\n"); \
-        assert(!(condition));                     \
-    } while (0)
+enum {
+    ALERT_STATE_COLD = -1,
+    ALERT_STATE_NORMAL = 0,
+    ALERT_STATE_HOT = 1
+};
 
-// define the dplist to contain the information
-dplist_t *list = NULL;
-
-void *element_copy(void *element)
+static const char *alert_state_to_text(int8_t state)
 {
-    sensor_t *original = (sensor_t *)element;
-
-    sensor_t *copy = malloc(sizeof(sensor_t));
-    if (copy == NULL)
-    {
-        // Handle memory allocation failure
-        return NULL;
-    }
-
-    copy->sensor_id = original->sensor_id;
-    copy->room_id = original->room_id;
-    copy->RUN_AVG = original->RUN_AVG;
-    copy->timestamp = original->timestamp;
-
-    // Copy the temperatures array using a loop
-    for (int i = 0; i < RUN_AVG_LENGTH; i++)
-    {
-        copy->temperatures[i] = original->temperatures[i];
-    }
-    return (void *)copy;
+    if (state == ALERT_STATE_COLD) return "COLD";
+    if (state == ALERT_STATE_HOT) return "HOT";
+    return "NORMAL";
 }
 
-void element_free(void **element)
+static void *element_copy(void *element)
 {
-    if ((*element) != NULL)
-    {
-        free((*element));
-        *element = NULL;
-    }
+    sensor_data_t *sensor = element;
+    sensor_data_t *sensor_copy = malloc(sizeof(*sensor_copy));
+
+    if (sensor_copy == NULL) return NULL;
+
+    *sensor_copy = *sensor;
+    return sensor_copy;
 }
 
-int element_compare(void *x, void *y)
+static void element_free(void **element)
 {
-    return ((((sensor_t *)x)->sensor_id < ((sensor_t *)y)->sensor_id) ? -1 : (((sensor_t *)x)->sensor_id == ((sensor_t *)y)->sensor_id) ? 0
-                                                                                                                                        : 1);
+    free(*element);
+    *element = NULL;
 }
-/**
- *  This method holds the core functionality of your datamgr. It takes in 2 file pointers to the sensor files and parses them.
- *  When the method finishes all data should be in the internal pointer list and all log messages should be printed to stderr.
- *  \param fp_sensor_map file pointer to the map file
- *  \param buffer this is the shared bufffer
- * \param pipe_mutex is a pointer that protect the fifo safe for write data
- * \param pipe_fd is the file discriptor for the the child process
- * \param all_data_read this is the flat to show if all data inside the buffer have been read.
- * \param database_fail is a flag for database
- */
-void datamgr_parse_sbuffer(FILE *fp_sensor_map, sbuffer_t *buffer, pthread_mutex_t *pipe_mutex, int *pipe_fd, int *all_data_read, int* database_fail)
+
+static int element_compare(void *x, void *y)
 {
-    char *log_message;
-    list = dpl_create(element_copy, element_free, element_compare);
-    sensor_id_t sensorId = 0, roomId = 0;
-    // get all the room id and sensor id
-    while (fscanf(fp_sensor_map, "%hu %hu", &roomId, &sensorId) == 2)
-    {
-        sensor_t *sensor = (sensor_t *)malloc(sizeof(sensor_t));
-        DPLIST_ERR_HANDLER(sensor == NULL, MEMORY_ERROR);
-        sensor->room_id = roomId;
-        sensor->sensor_id = sensorId;
-        sensor->RUN_AVG = 0.0;
-        sensor->timestamp = 0;
-        for (int i = 0; i < RUN_AVG_LENGTH; i++)
-        {
-            sensor->temperatures[i] = 0.0;
-        }
-        dpl_insert_at_index(list, sensor, 0, true);
-        free(sensor);
+    sensor_id_t sensor_id = *(sensor_id_t *)x;
+    sensor_data_t *sensor = y;
+
+    if (sensor_id == sensor->sensor_id) return 0;
+    return (sensor_id < sensor->sensor_id) ? -1 : 1;
+}
+
+static void write_log_message(FILE *file, const char *message)
+{
+    if (file == NULL) return;
+    fputs(message, file);
+    fflush(file);
+}
+
+static void write_data_log(FILE *file, const sensor_data_t *sensor)
+{
+    const char *status = "WARMUP";
+
+    if (file == NULL || sensor == NULL) return;
+    if (sensor->sample_count >= RUN_AVG_LENGTH) {
+        status = alert_state_to_text(sensor->alert_state);
     }
 
-    sensor_data_t data;
-    sensor_t *dummy_sensor = NULL;
-
-    while (!(*all_data_read) || !sbuffer_is_empty(buffer))
-    {
-        if (sbuffer_remove(buffer, &data, DATAMGR_READ, database_fail) == SBUFFER_SUCCESS)
-        {
-            double RUN_TEMP_TOTAL = 0;
-            double RUN_AVG = 0;
-            dummy_sensor = datamgr_get_sensor(data.id);
-            if (dummy_sensor == NULL)
-            {
-                printf("There is no such a sensor id : %hd on the map.\n", data.id);
-            }
-            else
-            {
-                if (data.value >= 100.0 || data.value <= -50.0)
-                {
-                    printf("the invailed temp is %lf, this sensor id is %hd\n", data.value, data.id);
-                    printf("The temperature measurement has an error.\n");
-                }
-                else
-                {
-
-                    dummy_sensor->timestamp = data.ts;
-                    // shift the array 1->0 2->1
-                    for (int count = 1; count < RUN_AVG_LENGTH; count++)
-                    {
-                        dummy_sensor->temperatures[count - 1] = dummy_sensor->temperatures[count];
-                    }
-                    dummy_sensor->temperatures[RUN_AVG_LENGTH - 1] = data.value;
-                    for (int count = 0; count < RUN_AVG_LENGTH; count++)
-                    {
-                        RUN_TEMP_TOTAL = RUN_TEMP_TOTAL + dummy_sensor->temperatures[count];
-                    }
-                    RUN_AVG = RUN_TEMP_TOTAL / RUN_AVG_LENGTH;
-                    dummy_sensor->RUN_AVG = RUN_AVG;
-                    // printf("the sensor id is %hd the room id is %hd, and the temperature is %lf\n", dummy_sensor->sensor_id, dummy_sensor->room_id, temp_value);
-                    if (dummy_sensor->temperatures[0] != 0.0)
-                    {
-                        printf("the sensor %hd, in room %hd, the RUN_AVG is %lf\n", dummy_sensor->sensor_id, dummy_sensor->room_id, dummy_sensor->RUN_AVG);
-                        if (RUN_AVG < SET_MIN_TEMP)
-                        {
-                            // send to child process
-                            asprintf(&log_message, "The sensor node with ID:%hd, reports it's too cold (running avg temperature = < %lf >)\n ", dummy_sensor->sensor_id, RUN_AVG);
-                            send_into_pipe(pipe_mutex, pipe_fd, log_message);
-                        }
-                        else if (RUN_AVG > SET_MAX_TEMP)
-                        { // send to child process
-                            asprintf(&log_message, "The sensor node with ID:%hd, reports it's too hot (running avg temperature = < %lf >)\n ", dummy_sensor->sensor_id, RUN_AVG);
-                            send_into_pipe(pipe_mutex, pipe_fd, log_message);
-                        }
-                    }
-                }
-            }
-        }
-        if (dpl_size(list) == -1)
-        { // if the datamgr_free being called exit the loop immidiately;
-            break;
-        }
-    }
+    fprintf(
+        file,
+        "DATA port=%d room=%hu sensor=%hu temp=%.2f avg=%.2f status=%s ts=%ld\n",
+        listen_port,
+        sensor->room_id,
+        sensor->sensor_id,
+        sensor->value,
+        sensor->RUN_AVG,
+        status,
+        (long)sensor->timestamp
+    );
 }
 
-/**
- * This method should be called to clean up the datamgr, and to free all used memory.
- * After this, any call to datamgr_get_room_id, datamgr_get_avg, datamgr_get_last_modified or datamgr_get_total_sensors will not return a valid result
- */
-void datamgr_free()
+void datamgr_set_listen_port(int port)
 {
-    dpl_free(&list, true);
+    listen_port = port;
 }
 
-// get the sensor if we know the sensor_id
-
-sensor_t *datamgr_get_sensor(sensor_id_t sensor_id)
+static sensor_data_t *datamgr_get_sensor(sensor_id_t sensor_id)
 {
-    sensor_t *sensor = NULL;
-    for (int index = 0; index < dpl_size(list); index++)
-    {
-        sensor = (sensor_t *)dpl_get_element_at_index(list, index);
-        if (sensor->sensor_id == sensor_id)
-        {
+    for (int index = 0; index < dpl_size(list); index++) {
+        sensor_data_t *sensor = dpl_get_element_at_index(list, index);
+        if (sensor != NULL && sensor->sensor_id == sensor_id) {
             return sensor;
         }
     }
+
     return NULL;
+}
+
+static int load_sensor_map(FILE *fp_sensor_map)
+{
+    sensor_id_t sensor_id;
+    uint16_t room_id;
+
+    if (fp_sensor_map == NULL) return -1;
+
+    if (list != NULL) {
+        dpl_free(&list, true);
+    }
+
+    list = dpl_create(element_copy, element_free, element_compare);
+    if (list == NULL) return -1;
+
+    while (fscanf(fp_sensor_map, "%hu %hu", &sensor_id, &room_id) == 2) {
+        sensor_data_t sensor = {0};
+
+        sensor.sensor_id = sensor_id;
+        sensor.room_id = room_id;
+        sensor.alert_state = ALERT_STATE_NORMAL;
+
+        if (dpl_insert_at_index(list, &sensor, dpl_size(list), true) == NULL) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void update_running_average(sensor_data_t *sensor, sensor_value_t new_value)
+{
+    double total = 0;
+    size_t window_size;
+
+    if (sensor->sample_count < RUN_AVG_LENGTH) {
+        sensor->temperatures[sensor->sample_count] = new_value;
+        sensor->sample_count++;
+    } else {
+        for (size_t index = 0; index < RUN_AVG_LENGTH - 1; index++) {
+            sensor->temperatures[index] = sensor->temperatures[index + 1];
+        }
+        sensor->temperatures[RUN_AVG_LENGTH - 1] = new_value;
+        sensor->sample_count++;
+    }
+
+    window_size = sensor->sample_count < RUN_AVG_LENGTH ? sensor->sample_count : RUN_AVG_LENGTH;
+    for (size_t index = 0; index < window_size; index++) {
+        total += sensor->temperatures[index];
+    }
+    sensor->RUN_AVG = total / (double)window_size;
+}
+
+void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
+{
+    FILE *log_file;
+    char startup_msg[192];
+
+    if (listen_port <= 0) {
+#ifdef PORT
+        listen_port = PORT;
+#else
+        listen_port = 0;
+#endif
+    }
+
+    if (sbuffer == NULL || fp_sensor_map == NULL) return;
+    if (load_sensor_map(fp_sensor_map) != 0) return;
+    log_file = fopen(FIFO_LOG, "a");
+    if (log_file != NULL) {
+        // Keep logging throughput stable under high-frequency sender traffic.
+        setvbuf(log_file, NULL, _IOFBF, 1024 * 1024);
+        snprintf(
+            startup_msg,
+            sizeof(startup_msg),
+            "START port=%d min=%.2f max=%.2f avg_window=%d\n",
+            listen_port,
+            (double)SET_MIN_TEMP,
+            (double)SET_MAX_TEMP,
+            RUN_AVG_LENGTH
+        );
+        write_log_message(log_file, startup_msg);
+    }
+
+    while (true) {
+        sensor_data_t measurement;
+        sensor_data_t *sensor;
+        int new_alert_state;
+        int rc;
+
+        rc = sbuffer_remove(sbuffer, &measurement);
+        if (rc == SBUFFER_CLOSED) break;
+        if (rc != SBUFFER_SUCCESS) {
+            break;
+        }
+
+        sensor = datamgr_get_sensor(measurement.sensor_id);
+        if (sensor == NULL) {
+            char buffer[128];
+
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "INVALID port=%d sensor=%hu\n",
+                listen_port,
+                measurement.sensor_id
+            );
+            write_log_message(log_file, buffer);
+            continue;
+        }
+
+        sensor->value = measurement.value;
+        sensor->timestamp = measurement.timestamp;
+        update_running_average(sensor, measurement.value);
+        new_alert_state = ALERT_STATE_NORMAL;
+
+        if (sensor->sample_count >= RUN_AVG_LENGTH) {
+            char buffer[160];
+
+            if (sensor->RUN_AVG < SET_MIN_TEMP) {
+                new_alert_state = ALERT_STATE_COLD;
+            } else if (sensor->RUN_AVG > SET_MAX_TEMP) {
+                new_alert_state = ALERT_STATE_HOT;
+            }
+
+            if (new_alert_state != sensor->alert_state) {
+                if (new_alert_state == ALERT_STATE_COLD) {
+                    snprintf(
+                        buffer,
+                        sizeof(buffer),
+                        "ALERT room=%hu sensor=%hu status=COLD avg=%.2f\n",
+                        sensor->room_id,
+                        sensor->sensor_id,
+                        sensor->RUN_AVG
+                    );
+                    write_log_message(log_file, buffer);
+                } else if (new_alert_state == ALERT_STATE_HOT) {
+                    snprintf(
+                        buffer,
+                        sizeof(buffer),
+                        "ALERT room=%hu sensor=%hu status=HOT avg=%.2f\n",
+                        sensor->room_id,
+                        sensor->sensor_id,
+                        sensor->RUN_AVG
+                    );
+                    write_log_message(log_file, buffer);
+                } else {
+                    snprintf(
+                        buffer,
+                        sizeof(buffer),
+                        "RECOVERY room=%hu sensor=%hu status=NORMAL avg=%.2f\n",
+                        sensor->room_id,
+                        sensor->sensor_id,
+                        sensor->RUN_AVG
+                    );
+                    write_log_message(log_file, buffer);
+                }
+            }
+        }
+
+        sensor->alert_state = new_alert_state;
+        write_data_log(log_file, sensor);
+    }
+
+    if (log_file != NULL) {
+        write_log_message(log_file, "STOP receiver drained queue and exited\n");
+        fclose(log_file);
+    }
+}
+
+void datamgr_free(void)
+{
+    if (list != NULL) {
+        dpl_free(&list, true);
+    }
 }

@@ -48,21 +48,22 @@
 #define    TYPE                 SOCK_STREAM     // streaming protool type
 #define    PROTOCOL             IPPROTO_TCP     // TCP protocol
 
-/**
- * Structure for holding the TCP socket information
- */
-struct tcpsock {
-    long cookie;        /**< if the socket is bound, cookie should be equal to MAGIC_COOKIE */
-    // remark: the use of magic cookies doesn't guarantee a 'bullet proof' test
-    int sd;             /**< socket descriptor */
-    char *ip_addr;      /**< socket IP address */
-    int port;           /**< socket port number */
-};
+// /**
+//  * Structure for holding the TCP socket information
+//  */
+// struct tcpsock {
+//     long cookie;        /**< if the socket is bound, cookie should be equal to MAGIC_COOKIE */
+//     // remark: the use of magic cookies doesn't guarantee a 'bullet proof' test
+//     int sd;             /**< socket descriptor */
+//     char *ip_addr;      /**< socket IP address */
+//     int port;           /**< socket port number */
+// };
 
-static tcpsock_t *tcp_sock_create();
+static tcpsock_t *tcp_sock_create(void);
 
 int tcp_passive_open(tcpsock_t **sock, int port) {
     int result;
+    int reuse = 1;
     struct sockaddr_in addr;
     TCP_ERR_HANDLER(((port < MIN_PORT) || (port > MAX_PORT)), return TCP_ADDRESS_ERROR);
     tcpsock_t *s = tcp_sock_create();
@@ -70,6 +71,9 @@ int tcp_passive_open(tcpsock_t **sock, int port) {
     s->sd = socket(PROTOCOLFAMILY, TYPE, PROTOCOL);
     TCP_DEBUG_PRINTF(s->sd < 0, "Socket() failed with errno = %d [%s]", errno, strerror(errno));
     TCP_ERR_HANDLER(s->sd < 0, free(s);return TCP_SOCKOP_ERROR);
+    result = setsockopt(s->sd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    TCP_DEBUG_PRINTF(result == -1, "setsockopt(SO_REUSEADDR) failed with errno = %d [%s]", errno, strerror(errno));
+    TCP_ERR_HANDLER(result != 0, free(s);return TCP_SOCKOP_ERROR);
     // Construct the server address structure
     memset(&addr, 0, sizeof(struct sockaddr_in));
     addr.sin_family = PROTOCOLFAMILY;
@@ -180,6 +184,9 @@ int tcp_wait_for_connection(tcpsock_t *socket, tcpsock_t **new_socket) {
 }
 
 int tcp_send(tcpsock_t *socket, void *buffer, int *buf_size) {
+    int requested;
+    int total_sent = 0;
+
     TCP_ERR_HANDLER(socket == NULL, return TCP_SOCKET_ERROR);
     TCP_ERR_HANDLER(socket->cookie != MAGIC_COOKIE, return TCP_SOCKET_ERROR);
     if ((buffer == NULL) || (buf_size == 0)) //nothing to send
@@ -187,21 +194,37 @@ int tcp_send(tcpsock_t *socket, void *buffer, int *buf_size) {
         *buf_size = 0;
         return TCP_NO_ERROR;
     }
-    // if socket is not connected, a SIGPIPE signal is sent which terminates the program (default behaviour)
-    //*buf_size = sendto(socket->sd, (const void*)buffer,*buf_size, 0, NULL, 0);
-    // use MSG_NOSIGNAL flag to avoid a signal to be sent
-    *buf_size = sendto(socket->sd, (const void *) buffer, *buf_size, MSG_NOSIGNAL, NULL, 0);
-    TCP_DEBUG_PRINTF((*buf_size == 0), "Send() : no connection to peer\n");
-    TCP_ERR_HANDLER(*buf_size == 0, return TCP_CONNECTION_CLOSED);
-    TCP_DEBUG_PRINTF(((*buf_size < 0) && ((errno == EPIPE) || (errno == ENOTCONN))),
-                     "Send() : no connection to peer\n");
-    TCP_ERR_HANDLER(((*buf_size < 0) && ((errno == EPIPE) || (errno == ENOTCONN))), return TCP_CONNECTION_CLOSED);
-    TCP_DEBUG_PRINTF(*buf_size < 0, "Send() failed with errno = %d [%s]", errno, strerror(errno));
-    TCP_ERR_HANDLER(*buf_size < 0, return TCP_SOCKOP_ERROR);
+
+    requested = *buf_size;
+    while (total_sent < requested) {
+        int sent = sendto(
+            socket->sd,
+            (const char *)buffer + total_sent,
+            requested - total_sent,
+            MSG_NOSIGNAL,
+            NULL,
+            0
+        );
+
+        TCP_DEBUG_PRINTF((sent == 0), "Send() : no connection to peer\n");
+        TCP_ERR_HANDLER(sent == 0, *buf_size = total_sent; return TCP_CONNECTION_CLOSED);
+        TCP_DEBUG_PRINTF(((sent < 0) && ((errno == EPIPE) || (errno == ENOTCONN))),
+                         "Send() : no connection to peer\n");
+        TCP_ERR_HANDLER(((sent < 0) && ((errno == EPIPE) || (errno == ENOTCONN))),
+                        *buf_size = total_sent; return TCP_CONNECTION_CLOSED);
+        TCP_DEBUG_PRINTF(sent < 0, "Send() failed with errno = %d [%s]", errno, strerror(errno));
+        TCP_ERR_HANDLER(sent < 0, *buf_size = total_sent; return TCP_SOCKOP_ERROR);
+        total_sent += sent;
+    }
+
+    *buf_size = total_sent;
     return TCP_NO_ERROR;
 }
 
 int tcp_receive(tcpsock_t *socket, void *buffer, int *buf_size) {
+    int requested;
+    int total_received = 0;
+
     TCP_ERR_HANDLER(socket == NULL, return TCP_SOCKET_ERROR);
     TCP_ERR_HANDLER(socket->cookie != MAGIC_COOKIE, return TCP_SOCKET_ERROR);
     if ((buffer == NULL) || (buf_size == 0))  //nothing to read
@@ -209,13 +232,22 @@ int tcp_receive(tcpsock_t *socket, void *buffer, int *buf_size) {
         *buf_size = 0;
         return TCP_NO_ERROR;
     }
-    *buf_size = recv(socket->sd, buffer, *buf_size, 0);
-    TCP_DEBUG_PRINTF(*buf_size == 0, "Recv() : no connection to peer\n");
-    TCP_ERR_HANDLER(*buf_size == 0, return TCP_CONNECTION_CLOSED);
-    TCP_DEBUG_PRINTF((*buf_size < 0) && (errno == ENOTCONN), "Recv() : no connection to peer\n");
-    TCP_ERR_HANDLER((*buf_size < 0) && (errno == ENOTCONN), return TCP_CONNECTION_CLOSED);
-    TCP_DEBUG_PRINTF(*buf_size < 0, "Recv() failed with errno = %d [%s]", errno, strerror(errno));
-    TCP_ERR_HANDLER(*buf_size < 0, return TCP_SOCKOP_ERROR);
+
+    requested = *buf_size;
+    while (total_received < requested) {
+        int received = recv(socket->sd, (char *)buffer + total_received, requested - total_received, 0);
+
+        TCP_DEBUG_PRINTF(received == 0, "Recv() : no connection to peer\n");
+        TCP_ERR_HANDLER(received == 0, *buf_size = total_received; return TCP_CONNECTION_CLOSED);
+        TCP_DEBUG_PRINTF((received < 0) && (errno == ENOTCONN), "Recv() : no connection to peer\n");
+        TCP_ERR_HANDLER((received < 0) && (errno == ENOTCONN),
+                        *buf_size = total_received; return TCP_CONNECTION_CLOSED);
+        TCP_DEBUG_PRINTF(received < 0, "Recv() failed with errno = %d [%s]", errno, strerror(errno));
+        TCP_ERR_HANDLER(received < 0, *buf_size = total_received; return TCP_SOCKOP_ERROR);
+        total_received += received;
+    }
+
+    *buf_size = total_received;
     return TCP_NO_ERROR;
 }
 
@@ -240,7 +272,7 @@ int tcp_get_sd(tcpsock_t *socket, int *sd) {
     return TCP_NO_ERROR;
 }
 
-static tcpsock_t *tcp_sock_create() {
+static tcpsock_t *tcp_sock_create(void) {
     tcpsock_t *s = (tcpsock_t *) malloc(sizeof(tcpsock_t));
     if (s) // init the socket to default values
     {
