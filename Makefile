@@ -25,10 +25,10 @@ all: sensor_gateway sensor_node $(ALL_FILE_CREATOR_TARGET)
 
 # When trying to compile one of the executables, first look for its .c files
 # Then check if the libraries are in the lib folder
-sensor_gateway : main.c connmgr.c datamgr.c sensor_db.c sbuffer.c lib/libdplist.so lib/libtcpsock.so
+sensor_gateway : main.c connmgr.c datamgr.c sensor_db.c lib/libdplist.so lib/libtcpsock.so
 	@echo "$(TITLE_COLOR)\n***** CPPCHECK *****$(NO_COLOR)"
 	@if command -v $(CPPCHECK) >/dev/null 2>&1; then \
-		$(CPPCHECK) --enable=all --suppress=missingIncludeSystem main.c connmgr.c datamgr.c sensor_db.c sbuffer.c; \
+		$(CPPCHECK) --enable=all --suppress=missingIncludeSystem main.c connmgr.c datamgr.c sensor_db.c; \
 	else \
 		echo "cppcheck not found, skipping static analysis"; \
 	fi
@@ -37,9 +37,8 @@ sensor_gateway : main.c connmgr.c datamgr.c sensor_db.c sbuffer.c lib/libdplist.
 	gcc -c connmgr.c   -Wall -std=c11 -Werror $(CPPFLAGS_COMMON) -o connmgr.o   -fdiagnostics-color=auto
 	gcc -c datamgr.c   -Wall -std=c11 -Werror $(CPPFLAGS_COMMON) -o datamgr.o   -fdiagnostics-color=auto
 	gcc -c sensor_db.c -Wall -std=c11 -Werror $(CPPFLAGS_COMMON) -o sensor_db.o -fdiagnostics-color=auto
-	gcc -c sbuffer.c   -Wall -std=c11 -Werror $(CPPFLAGS_COMMON) -o sbuffer.o   -fdiagnostics-color=auto
 	@echo "$(TITLE_COLOR)\n***** LINKING sensor_gateway *****$(NO_COLOR)"
-	gcc main.o connmgr.o datamgr.o sensor_db.o sbuffer.o -ldplist -ltcpsock -lpthread -o sensor_gateway -Wall -L./lib -Wl,-rpath,./lib -lsqlite3 -fdiagnostics-color=auto
+	gcc main.o connmgr.o datamgr.o sensor_db.o -ldplist -ltcpsock -o sensor_gateway -Wall -L./lib -Wl,-rpath,./lib -lsqlite3 -fdiagnostics-color=auto
 
 file_creator : file_creator.c
 	@echo "$(TITLE_COLOR)\n***** COMPILE & LINKING file_creator *****$(NO_COLOR)"

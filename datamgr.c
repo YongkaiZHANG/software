@@ -2,10 +2,11 @@
  * \author Yongkai Zhang
  */
 
-#include <pthread.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include "config.h"
 #include "datamgr.h"
 
@@ -152,7 +153,27 @@ static void update_running_average(sensor_data_t *sensor, sensor_value_t new_val
     sensor->RUN_AVG = total / (double)window_size;
 }
 
-void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
+static int read_exact(int input_fd, void *buffer, size_t size)
+{
+    char *cursor = buffer;
+    size_t received = 0;
+
+    while (received < size) {
+        ssize_t rc = read(input_fd, cursor + received, size - received);
+
+        if (rc == 0) {
+            return received == 0 ? 0 : -1;
+        }
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        received += (size_t)rc;
+    }
+    return 1;
+}
+
+int datamgr_parse_sensor_pipe(int input_fd, FILE *fp_sensor_map)
 {
     FILE *log_file;
     size_t pending_data_lines = 0;
@@ -166,8 +187,8 @@ void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
 #endif
     }
 
-    if (sbuffer == NULL || fp_sensor_map == NULL) return;
-    if (load_sensor_map(fp_sensor_map) != 0) return;
+    if (input_fd < 0 || fp_sensor_map == NULL) return -1;
+    if (load_sensor_map(fp_sensor_map) != 0) return -1;
     log_file = fopen(FIFO_LOG, "a");
     if (log_file != NULL) {
         // Flush each line so logs are observable in real time while debugging.
@@ -190,9 +211,9 @@ void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
         int new_alert_state;
         int rc;
 
-        rc = sbuffer_remove(sbuffer, &measurement);
-        if (rc == SBUFFER_CLOSED) break;
-        if (rc != SBUFFER_SUCCESS) {
+        rc = read_exact(input_fd, &measurement, sizeof(measurement));
+        if (rc == 0) break;
+        if (rc < 0) {
             break;
         }
 
@@ -295,6 +316,7 @@ void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
         write_log_message(log_file, "STOP receiver drained queue and exited\n");
         fclose(log_file);
     }
+    return 0;
 }
 
 void datamgr_free(void)

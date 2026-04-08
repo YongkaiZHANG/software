@@ -1,14 +1,14 @@
-#include <pthread.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "config.h"
 #include "connmgr.h"
 #include "datamgr.h"
-#include "sbuffer.h"
 
 typedef struct {
-    sbuffer_t *buffer;
     int port;
     int timeout_seconds;
 } app_context_t;
@@ -65,45 +65,73 @@ static int parse_runtime_args(int argc, char *argv[], app_context_t *context)
     return -1;
 }
 
-static void *connmgr_start(void *arg)
+static int run_connmgr_child(const app_context_t *context, int pipe_write_fd)
 {
-    app_context_t *context = arg;
+    if (context == NULL) return EXIT_FAILURE;
 
-    /* Producer side: network ingress -> shared sbuffer. */
-    connmgr_listen(&context->buffer, context->port, context->timeout_seconds);
-    return NULL;
+    signal(SIGPIPE, SIG_IGN);
+    return connmgr_listen(pipe_write_fd, context->port, context->timeout_seconds);
 }
 
-static void *datamgr_start(void *arg)
+static int run_datamgr_child(const app_context_t *context, int pipe_read_fd)
 {
-    app_context_t *context = arg;
     FILE *map_file = fopen("room_sensor.map", "r");
 
+    if (context == NULL) return EXIT_FAILURE;
     if (map_file == NULL) {
         perror("fopen");
-        return NULL;
+        return EXIT_FAILURE;
     }
 
-    /* Consumer side: sbuffer -> running averages -> gateway.log. */
-    datamgr_parse_sensor_sbuffer(context->buffer, map_file);
+    datamgr_set_listen_port(context->port);
+    /* Child side: pipe input -> running averages -> gateway.log. */
+    if (datamgr_parse_sensor_pipe(pipe_read_fd, map_file) != 0) {
+        fclose(map_file);
+        datamgr_free();
+        return EXIT_FAILURE;
+    }
     fclose(map_file);
-    return NULL;
+    datamgr_free();
+    return EXIT_SUCCESS;
+}
+
+static int wait_for_child(pid_t pid, const char *label)
+{
+    int status;
+
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return EXIT_FAILURE;
+    }
+    if (WIFEXITED(status)) {
+        int exit_code = WEXITSTATUS(status);
+
+        if (exit_code != EXIT_SUCCESS) {
+            fprintf(stderr, "%s exited with status %d\n", label, exit_code);
+        }
+        return exit_code;
+    }
+    if (WIFSIGNALED(status)) {
+        fprintf(stderr, "%s terminated by signal %d\n", label, WTERMSIG(status));
+    }
+    return EXIT_FAILURE;
 }
 
 int main(int argc, char *argv[])
 {
     app_context_t context = {0};
-    pthread_t connmgr_thread;
-    pthread_t datamgr_thread;
+    int data_pipe[2];
+    pid_t datamgr_pid;
+    pid_t connmgr_pid;
     FILE *log_file;
+    int connmgr_status;
+    int datamgr_status;
 
     if (parse_runtime_args(argc, argv, &context) != 0) {
         return EXIT_FAILURE;
     }
-    datamgr_set_listen_port(context.port);
-
-    if (sbuffer_init(&context.buffer) != SBUFFER_SUCCESS) {
-        fprintf(stderr, "Unable to initialize shared buffer\n");
+    if (access("room_sensor.map", R_OK) != 0) {
+        perror("room_sensor.map");
         return EXIT_FAILURE;
     }
 
@@ -112,26 +140,47 @@ int main(int argc, char *argv[])
         fclose(log_file);
     }
 
-    /* Start consumer first so queued data can be drained immediately. */
-    if (pthread_create(&datamgr_thread, NULL, datamgr_start, &context) != 0) {
-        perror("pthread_create");
-        sbuffer_free(&context.buffer);
+    if (pipe(data_pipe) != 0) {
+        perror("pipe");
         return EXIT_FAILURE;
     }
 
-    /* Then start producer side (TCP listener). */
-    if (pthread_create(&connmgr_thread, NULL, connmgr_start, &context) != 0) {
-        perror("pthread_create");
-        pthread_join(datamgr_thread, NULL);
-        datamgr_free();
-        sbuffer_free(&context.buffer);
+    /* Start the consumer child first so the pipe reader is ready. */
+    datamgr_pid = fork();
+    if (datamgr_pid < 0) {
+        perror("fork");
+        close(data_pipe[0]);
+        close(data_pipe[1]);
         return EXIT_FAILURE;
     }
+    if (datamgr_pid == 0) {
+        close(data_pipe[1]);
+        exit(run_datamgr_child(&context, data_pipe[0]));
+    }
 
-    pthread_join(connmgr_thread, NULL);
-    pthread_join(datamgr_thread, NULL);
+    /* Then start the TCP receiver child that feeds the pipe. */
+    connmgr_pid = fork();
+    if (connmgr_pid < 0) {
+        perror("fork");
+        close(data_pipe[0]);
+        close(data_pipe[1]);
+        kill(datamgr_pid, SIGTERM);
+        waitpid(datamgr_pid, NULL, 0);
+        return EXIT_FAILURE;
+    }
+    if (connmgr_pid == 0) {
+        close(data_pipe[0]);
+        exit(run_connmgr_child(&context, data_pipe[1]));
+    }
 
-    datamgr_free();
-    sbuffer_free(&context.buffer);
+    close(data_pipe[0]);
+    close(data_pipe[1]);
+
+    connmgr_status = wait_for_child(connmgr_pid, "connmgr child");
+    datamgr_status = wait_for_child(datamgr_pid, "datamgr child");
+
+    if (connmgr_status != EXIT_SUCCESS || datamgr_status != EXIT_SUCCESS) {
+        return EXIT_FAILURE;
+    }
     return EXIT_SUCCESS;
 }

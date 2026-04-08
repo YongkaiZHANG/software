@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include "config.h"
 #include "lib/dplist.h"
-#include "sbuffer.h"
 
 #ifndef RUN_AVG_LENGTH
 #define RUN_AVG_LENGTH 5
@@ -32,13 +31,11 @@
 
 
 /**
- *  This method holds the core functionality of your datamgr. It takes  pointers to the sbuffer and parses them. 
- *  When the method finishes all data should be in the internal pointer list and all log messages should be printed to stderr.
- *  \param sbuffer  pointer to the sbuffer
- *  \param fp_sensor_data file pointer to the binary data file
+ *  Reads validated measurements from the connmgr pipe and updates
+ *  the in-memory sensor state plus gateway.log output.
  */
 void datamgr_set_listen_port(int port);
-void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_data);
+int datamgr_parse_sensor_pipe(int input_fd, FILE *fp_sensor_data);
 
 /**
  * This method should be called to clean up the datamgr, and to free all used memory. 

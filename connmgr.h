@@ -8,7 +8,6 @@
 #include "lib/tcpsock.h"
 #include "lib/dplist.h"
 #include "config.h"
-#include "sbuffer.h"
 
 #ifndef TIMEOUT
  // #error TIMEOUT not specified!(in seconds)
@@ -24,11 +23,11 @@ typedef struct{
 } pollinfo;
 
 /*
- * This method holds the core functionality of your connmgr. It starts listening on the given port and
- * when when a sensor node connects it writes the data to a sensor_data_recv file. This file must have the
- *same format as the sensor_data file in assignment 6 and 7.
+ * Starts the TCP receiver process.
+ * Valid measurements are written to sensor_data_recv.txt and forwarded
+ * to the datamgr child through the supplied pipe write end.
  */
-void* connmgr_listen(sbuffer_t **sbuffer, int port, int timeout_seconds);
+int connmgr_listen(int pipe_write_fd, int port, int timeout_seconds);
 
 /*
  * This method should be called to clean up the connmgr, and to free all used memory.

@@ -1,51 +1,44 @@
 #include <errno.h>
-#include <pthread.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include "config.h"
 #include "connmgr.h"
 #include "lib/tcpsock.h"
-#include "sbuffer.h"
 
 #ifndef TIMEOUT
 #error TIMEOUT not defined
 #endif
 
-/* One detached worker thread per active TCP sender connection. */
-typedef struct client_ctx {
-    tcpsock_t *client;
-    struct client_ctx *next;
-} client_ctx_t;
+typedef struct worker_proc {
+    pid_t pid;
+    struct worker_proc *next;
+} worker_proc_t;
 
-/* In-memory copy of room_sensor.map entries (room -> sensor). */
 typedef struct {
     uint16_t room_id;
     sensor_id_t sensor_id;
 } sensor_map_entry_t;
 
-static sbuffer_t **shared_buffer = NULL;
-/*
- * Protects shared runtime state:
- * - client linked list and active client count
- * - counters and last_data_timestamp
- * - receiver raw data file append section
- */
-static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
-static client_ctx_t *client_list = NULL;
-static int active_clients = 0;
-static unsigned long long total_received = 0;
-static unsigned long long total_dropped = 0;
-static unsigned long long total_rejected = 0;
-static time_t last_data_timestamp = 0;
-static FILE *receiver_data_file = NULL;
+static int datamgr_pipe_fd = -1;
+static int stats_pipe_read_fd = -1;
+static int stats_pipe_write_fd = -1;
+static int receiver_data_fd = -1;
+static int server_socket_fd = -1;
+static worker_proc_t *worker_list = NULL;
 static sensor_map_entry_t *sensor_map_entries = NULL;
 static size_t sensor_map_count = 0;
+static unsigned long long total_received = 0;
+static unsigned long long total_rejected = 0;
+static time_t last_data_timestamp = 0;
 
 static void free_sensor_map(void)
 {
@@ -74,7 +67,6 @@ static int load_sensor_map(void)
         return -1;
     }
 
-    /* Input format: <room_id> <sensor_id> per line. */
     while (fscanf(map_file, "%hu %hu", &room_id, &sensor_id) == 2) {
         if (count == capacity) {
             sensor_map_entry_t *resized;
@@ -108,7 +100,6 @@ static int load_sensor_map(void)
 
 static bool is_valid_sensor_pair(uint16_t room_id, sensor_id_t sensor_id)
 {
-    /* Linear scan is acceptable for this assignment-size map. */
     for (size_t i = 0; i < sensor_map_count; i++) {
         if (sensor_map_entries[i].room_id == room_id &&
             sensor_map_entries[i].sensor_id == sensor_id) {
@@ -118,132 +109,76 @@ static bool is_valid_sensor_pair(uint16_t room_id, sensor_id_t sensor_id)
     return false;
 }
 
+static int write_atomic_message(int fd, const void *buffer, size_t size)
+{
+    ssize_t written;
+
+    do {
+        written = write(fd, buffer, size);
+    } while (written < 0 && errno == EINTR);
+
+    if (written < 0 || (size_t)written != size) {
+        return -1;
+    }
+    return 0;
+}
+
+static int append_line_to_fd(int fd, const char *line)
+{
+    size_t len = 0;
+
+    if (fd < 0 || line == NULL) return -1;
+    while (line[len] != '\0') {
+        len++;
+    }
+    return write_atomic_message(fd, line, len);
+}
+
 static void log_rejected_pair(uint16_t room_id, sensor_id_t sensor_id)
 {
-    /*
-     * Keep this independent from datamgr log handle:
-     * connmgr can reject a pair before it enters the shared buffer pipeline.
-     */
-    FILE *log_file = fopen(FIFO_LOG, "a");
+    char line[128];
+    int log_fd;
 
-    if (log_file == NULL) return;
-    fprintf(
-        log_file,
+    snprintf(
+        line,
+        sizeof(line),
         "REJECT_INVALID_PAIR room=%hu sensor=%hu reason=not_in_map\n",
         room_id,
         sensor_id
     );
-    fflush(log_file);
-    fclose(log_file);
+    log_fd = open(FIFO_LOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log_fd < 0) return;
+    (void)append_line_to_fd(log_fd, line);
+    close(log_fd);
 }
 
-static void reset_runtime_stats(void)
+static int append_receiver_measurement(const sensor_data_t *data)
 {
-    pthread_mutex_lock(&state_mutex);
-    client_list = NULL;
-    active_clients = 0;
-    total_received = 0;
-    total_dropped = 0;
-    total_rejected = 0;
-    last_data_timestamp = time(NULL);
-    pthread_mutex_unlock(&state_mutex);
+    char line[128];
+
+    if (receiver_data_fd < 0 || data == NULL) return -1;
+    snprintf(
+        line,
+        sizeof(line),
+        "%hu %hu %.2f %ld\n",
+        data->room_id,
+        data->sensor_id,
+        data->value,
+        (long)data->timestamp
+    );
+    return append_line_to_fd(receiver_data_fd, line);
 }
 
-static void register_client(client_ctx_t *ctx)
+static int notify_parent(char event_code)
 {
-    pthread_mutex_lock(&state_mutex);
-    ctx->next = client_list;
-    client_list = ctx;
-    active_clients++;
-    pthread_mutex_unlock(&state_mutex);
+    if (stats_pipe_write_fd < 0) return -1;
+    return write_atomic_message(stats_pipe_write_fd, &event_code, sizeof(event_code));
 }
 
-static void unregister_client(client_ctx_t *ctx)
+static int forward_measurement(const sensor_data_t *data)
 {
-    client_ctx_t **cursor;
-
-    pthread_mutex_lock(&state_mutex);
-    cursor = &client_list;
-    while (*cursor != NULL && *cursor != ctx) {
-        cursor = &(*cursor)->next;
-    }
-    if (*cursor == ctx) {
-        *cursor = ctx->next;
-    }
-    if (active_clients > 0) {
-        active_clients--;
-    }
-    pthread_mutex_unlock(&state_mutex);
-}
-
-static int get_active_clients(void)
-{
-    int count;
-
-    pthread_mutex_lock(&state_mutex);
-    count = active_clients;
-    pthread_mutex_unlock(&state_mutex);
-    return count;
-}
-
-static time_t get_last_data_timestamp(void)
-{
-    time_t timestamp;
-
-    pthread_mutex_lock(&state_mutex);
-    timestamp = last_data_timestamp;
-    pthread_mutex_unlock(&state_mutex);
-    return timestamp;
-}
-
-static void update_receive_stats(bool dropped)
-{
-    pthread_mutex_lock(&state_mutex);
-    total_received++;
-    if (dropped) total_dropped++;
-    last_data_timestamp = time(NULL);
-    pthread_mutex_unlock(&state_mutex);
-}
-
-static void update_rejected_stats(void)
-{
-    pthread_mutex_lock(&state_mutex);
-    total_rejected++;
-    pthread_mutex_unlock(&state_mutex);
-}
-
-static void append_receiver_measurement(const sensor_data_t *data)
-{
-    if (data == NULL) return;
-
-    /* Serialized append to avoid interleaved writes from multiple workers. */
-    pthread_mutex_lock(&state_mutex);
-    if (receiver_data_file != NULL) {
-        fprintf(
-            receiver_data_file,
-            "%hu %hu %.2f %ld\n",
-            data->room_id,
-            data->sensor_id,
-            data->value,
-            (long)data->timestamp
-        );
-    }
-    pthread_mutex_unlock(&state_mutex);
-}
-
-static void shutdown_all_clients(void)
-{
-    client_ctx_t *ctx;
-
-    pthread_mutex_lock(&state_mutex);
-    for (ctx = client_list; ctx != NULL; ctx = ctx->next) {
-        int sd;
-
-        if (tcp_get_sd(ctx->client, &sd) == TCP_NO_ERROR) {
-            shutdown(sd, SHUT_RDWR);
-        }
-    }
-    pthread_mutex_unlock(&state_mutex);
+    if (datamgr_pipe_fd < 0 || data == NULL) return -1;
+    return write_atomic_message(datamgr_pipe_fd, data, sizeof(*data));
 }
 
 static int receive_measurement(tcpsock_t *client, sensor_data_t *data)
@@ -251,9 +186,6 @@ static int receive_measurement(tcpsock_t *client, sensor_data_t *data)
     int bytes;
     int rc;
 
-    /* Wire format order must match sender:
-     * sensor_id -> room_id -> value -> timestamp.
-     */
     bytes = sizeof(data->sensor_id);
     rc = tcp_receive(client, &data->sensor_id, &bytes);
     if (rc != TCP_NO_ERROR) return rc;
@@ -279,77 +211,221 @@ static int receive_measurement(tcpsock_t *client, sensor_data_t *data)
     return TCP_NO_ERROR;
 }
 
-static void *client_thread(void *arg)
+static void tcp_close_local_copy(tcpsock_t **socket)
 {
-    client_ctx_t *ctx = arg;
+    if (socket == NULL || *socket == NULL) return;
+    if ((*socket)->ip_addr != NULL) {
+        free((*socket)->ip_addr);
+    }
+    if ((*socket)->sd >= 0) {
+        close((*socket)->sd);
+    }
+    free(*socket);
+    *socket = NULL;
+}
+
+static void shutdown_client_socket(tcpsock_t *client)
+{
+    int sd;
+
+    if (client == NULL) return;
+    if (tcp_get_sd(client, &sd) == TCP_NO_ERROR) {
+        shutdown(sd, SHUT_RDWR);
+    }
+}
+
+static void worker_process(tcpsock_t *client)
+{
     sensor_data_t data;
 
-    while (receive_measurement(ctx->client, &data) == TCP_NO_ERROR) {
-        int insert_rc;
+    if (stats_pipe_read_fd >= 0) {
+        close(stats_pipe_read_fd);
+        stats_pipe_read_fd = -1;
+    }
+    if (server_socket_fd >= 0) {
+        close(server_socket_fd);
+        server_socket_fd = -1;
+    }
 
-        /* Reject invalid map pairs early and drop this connection. */
+    while (receive_measurement(client, &data) == TCP_NO_ERROR) {
         if (!is_valid_sensor_pair(data.room_id, data.sensor_id)) {
             log_rejected_pair(data.room_id, data.sensor_id);
-            update_rejected_stats();
+            (void)notify_parent('R');
+            shutdown_client_socket(client);
             break;
         }
 
-        append_receiver_measurement(&data);
-        insert_rc = sbuffer_insert(*shared_buffer, &data);
-        if (insert_rc == SBUFFER_FAILURE) break;
-        update_receive_stats(insert_rc == SBUFFER_DROPPED);
+        if (append_receiver_measurement(&data) != 0) {
+            break;
+        }
+        if (forward_measurement(&data) != 0) {
+            shutdown_client_socket(client);
+            break;
+        }
+        if (notify_parent('M') != 0) {
+            shutdown_client_socket(client);
+            break;
+        }
     }
 
-    tcp_close(&ctx->client);
-    unregister_client(ctx);
-    free(ctx);
-    return NULL;
+    tcp_close(&client);
+    if (stats_pipe_write_fd >= 0) close(stats_pipe_write_fd);
+    if (datamgr_pipe_fd >= 0) close(datamgr_pipe_fd);
+    if (receiver_data_fd >= 0) close(receiver_data_fd);
+    _exit(EXIT_SUCCESS);
 }
 
-void *connmgr_listen(sbuffer_t **sbuffer, int port, int timeout_seconds)
+static void add_worker(pid_t pid)
+{
+    worker_proc_t *worker = malloc(sizeof(*worker));
+
+    if (worker == NULL) return;
+    worker->pid = pid;
+    worker->next = worker_list;
+    worker_list = worker;
+}
+
+static void remove_worker(pid_t pid)
+{
+    worker_proc_t **cursor = &worker_list;
+
+    while (*cursor != NULL) {
+        if ((*cursor)->pid == pid) {
+            worker_proc_t *victim = *cursor;
+
+            *cursor = victim->next;
+            free(victim);
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
+static void reap_finished_workers(void)
+{
+    int status;
+    pid_t pid;
+
+    do {
+        pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            remove_worker(pid);
+        }
+    } while (pid > 0);
+}
+
+static void kill_all_workers(void)
+{
+    worker_proc_t *worker = worker_list;
+
+    while (worker != NULL) {
+        kill(worker->pid, SIGTERM);
+        worker = worker->next;
+    }
+}
+
+static void wait_all_workers(void)
+{
+    while (worker_list != NULL) {
+        worker_proc_t *worker = worker_list;
+
+        if (waitpid(worker->pid, NULL, 0) >= 0 || errno == ECHILD) {
+            remove_worker(worker->pid);
+        }
+    }
+}
+
+static int set_nonblocking(int fd)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL);
+    if (flags < 0) return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+    return 0;
+}
+
+static void drain_worker_events(void)
+{
+    char event_code;
+    ssize_t rc;
+
+    if (stats_pipe_read_fd < 0) return;
+
+    while (true) {
+        rc = read(stats_pipe_read_fd, &event_code, sizeof(event_code));
+        if (rc == 0) {
+            break;
+        }
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            break;
+        }
+
+        if (event_code == 'M') {
+            total_received++;
+            last_data_timestamp = time(NULL);
+        } else if (event_code == 'R') {
+            total_rejected++;
+        }
+    }
+}
+
+int connmgr_listen(int pipe_write_fd, int port, int timeout_seconds)
 {
     tcpsock_t *server = NULL;
-    int server_sd;
+    int stats_pipe[2];
+    int exit_code = EXIT_SUCCESS;
 
-    if (sbuffer == NULL || *sbuffer == NULL) return NULL;
-    if (port <= 0) return NULL;
+    if (pipe_write_fd < 0 || port <= 0) return EXIT_FAILURE;
     if (timeout_seconds < 0) timeout_seconds = TIMEOUT;
 
-    shared_buffer = sbuffer;
-    reset_runtime_stats();
+    signal(SIGPIPE, SIG_IGN);
+    datamgr_pipe_fd = pipe_write_fd;
+    last_data_timestamp = time(NULL);
+    total_received = 0;
+    total_rejected = 0;
+
     if (load_sensor_map() != 0) {
         fprintf(stderr, "Unable to load room_sensor.map for validation\n");
-        sbuffer_close(*shared_buffer);
-        return NULL;
+        return EXIT_FAILURE;
     }
 
-    receiver_data_file = fopen(RECEIVER_DATA_LOG, "w");
-    if (receiver_data_file != NULL) {
-        setvbuf(receiver_data_file, NULL, _IOLBF, 0);
-    } else {
-        perror("fopen sensor_data_recv.txt");
+    receiver_data_fd = open(
+        RECEIVER_DATA_LOG,
+        O_WRONLY | O_CREAT | O_TRUNC | O_APPEND,
+        0644
+    );
+    if (receiver_data_fd < 0) {
+        perror("open sensor_data_recv.txt");
+        free_sensor_map();
+        return EXIT_FAILURE;
+    }
+
+    if (pipe(stats_pipe) != 0) {
+        perror("pipe");
+        close(receiver_data_fd);
+        receiver_data_fd = -1;
+        free_sensor_map();
+        return EXIT_FAILURE;
+    }
+    stats_pipe_read_fd = stats_pipe[0];
+    stats_pipe_write_fd = stats_pipe[1];
+    if (set_nonblocking(stats_pipe_read_fd) != 0) {
+        perror("fcntl");
+        exit_code = EXIT_FAILURE;
+        goto cleanup;
     }
 
     if (tcp_passive_open(&server, port) != TCP_NO_ERROR) {
         fprintf(stderr, "Unable to start TCP server on port %d\n", port);
-        if (receiver_data_file != NULL) {
-            fclose(receiver_data_file);
-            receiver_data_file = NULL;
-        }
-        free_sensor_map();
-        sbuffer_close(*shared_buffer);
-        return NULL;
+        exit_code = EXIT_FAILURE;
+        goto cleanup;
     }
-
-    if (tcp_get_sd(server, &server_sd) != TCP_NO_ERROR) {
-        tcp_close(&server);
-        if (receiver_data_file != NULL) {
-            fclose(receiver_data_file);
-            receiver_data_file = NULL;
-        }
-        free_sensor_map();
-        sbuffer_close(*shared_buffer);
-        return NULL;
+    if (tcp_get_sd(server, &server_socket_fd) != TCP_NO_ERROR) {
+        exit_code = EXIT_FAILURE;
+        goto cleanup;
     }
 
     if (timeout_seconds == 0) {
@@ -362,59 +438,59 @@ void *connmgr_listen(sbuffer_t **sbuffer, int port, int timeout_seconds)
         );
     }
 
-    while (1) {
+    while (true) {
         fd_set readfds;
         struct timeval poll_timeout;
+        int max_fd;
         int ready;
 
+        reap_finished_workers();
         FD_ZERO(&readfds);
-        FD_SET(server_sd, &readfds);
+        FD_SET(server_socket_fd, &readfds);
+        FD_SET(stats_pipe_read_fd, &readfds);
+        max_fd = server_socket_fd > stats_pipe_read_fd ? server_socket_fd : stats_pipe_read_fd;
         poll_timeout.tv_sec = 1;
         poll_timeout.tv_usec = 0;
 
-        ready = select(server_sd + 1, &readfds, NULL, NULL, &poll_timeout);
+        ready = select(max_fd + 1, &readfds, NULL, NULL, &poll_timeout);
         if (ready < 0) {
             if (errno == EINTR) continue;
             perror("select");
+            exit_code = EXIT_FAILURE;
             break;
         }
 
-        if (ready > 0 && FD_ISSET(server_sd, &readfds)) {
+        if (ready > 0 && FD_ISSET(stats_pipe_read_fd, &readfds)) {
+            drain_worker_events();
+        }
+
+        if (ready > 0 && FD_ISSET(server_socket_fd, &readfds)) {
             tcpsock_t *client = NULL;
-            client_ctx_t *ctx;
-            pthread_t worker;
+            pid_t pid;
 
             if (tcp_wait_for_connection(server, &client) != TCP_NO_ERROR) {
                 fprintf(stderr, "Failed to accept an incoming connection\n");
-                continue;
+            } else {
+                pid = fork();
+                if (pid < 0) {
+                    perror("fork");
+                    tcp_close_local_copy(&client);
+                    exit_code = EXIT_FAILURE;
+                    break;
+                }
+                if (pid == 0) {
+                    tcp_close_local_copy(&server);
+                    worker_process(client);
+                }
+                add_worker(pid);
+                tcp_close_local_copy(&client);
             }
-
-            ctx = malloc(sizeof(*ctx));
-            if (ctx == NULL) {
-                tcp_close(&client);
-                perror("malloc");
-                break;
-            }
-            ctx->client = client;
-            ctx->next = NULL;
-            register_client(ctx);
-
-            if (pthread_create(&worker, NULL, client_thread, ctx) != 0) {
-                perror("pthread_create");
-                unregister_client(ctx);
-                tcp_close(&client);
-                free(ctx);
-                break;
-            }
-            pthread_detach(worker);
         }
 
         if (timeout_seconds > 0) {
             time_t now = time(NULL);
-            time_t last_data = get_last_data_timestamp();
 
-            /* Idle timeout is based on "last accepted data time", not connects. */
-            if (now - last_data >= timeout_seconds) {
+            if (now - last_data_timestamp >= timeout_seconds) {
                 printf(
                     "Connection manager idle timeout reached: %d seconds without incoming data\n",
                     timeout_seconds
@@ -424,33 +500,44 @@ void *connmgr_listen(sbuffer_t **sbuffer, int port, int timeout_seconds)
         }
     }
 
-    /* Stop producing and wake consumers before waiting workers to drain. */
-    shutdown_all_clients();
-    sbuffer_close(*shared_buffer);
-
-    while (get_active_clients() > 0) {
-        usleep(100000);
-    }
-
+cleanup:
+    kill_all_workers();
     if (server != NULL) {
         tcp_close(&server);
+        server = NULL;
+    }
+    if (server_socket_fd >= 0) {
+        close(server_socket_fd);
+        server_socket_fd = -1;
+    }
+    if (datamgr_pipe_fd >= 0) {
+        close(datamgr_pipe_fd);
+        datamgr_pipe_fd = -1;
+    }
+    if (stats_pipe_write_fd >= 0) {
+        close(stats_pipe_write_fd);
+        stats_pipe_write_fd = -1;
+    }
+    wait_all_workers();
+    drain_worker_events();
+    if (stats_pipe_read_fd >= 0) {
+        close(stats_pipe_read_fd);
+        stats_pipe_read_fd = -1;
+    }
+    if (receiver_data_fd >= 0) {
+        close(receiver_data_fd);
+        receiver_data_fd = -1;
     }
 
-    pthread_mutex_lock(&state_mutex);
-    if (receiver_data_file != NULL) {
-        fclose(receiver_data_file);
-        receiver_data_file = NULL;
-    }
     printf(
         "Connection manager stopped. total received=%llu, dropped=%llu, rejected=%llu (queue dropped=%llu)\n",
         total_received,
-        total_dropped,
+        0ULL,
         total_rejected,
-        sbuffer_get_drop_count(*shared_buffer)
+        0ULL
     );
-    pthread_mutex_unlock(&state_mutex);
     free_sensor_map();
-    return NULL;
+    return exit_code;
 }
 
 void connmgr_free(tcpsock_t *point)
