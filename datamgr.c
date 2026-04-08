@@ -176,6 +176,7 @@ static int read_exact(int input_fd, void *buffer, size_t size)
 int datamgr_parse_sensor_pipe(int input_fd, FILE *fp_sensor_map)
 {
     FILE *log_file;
+    sbuffer_t *buffer = NULL;
     size_t pending_data_lines = 0;
     char startup_msg[192];
 
@@ -189,6 +190,7 @@ int datamgr_parse_sensor_pipe(int input_fd, FILE *fp_sensor_map)
 
     if (input_fd < 0 || fp_sensor_map == NULL) return -1;
     if (load_sensor_map(fp_sensor_map) != 0) return -1;
+    if (sbuffer_init(&buffer) != SBUFFER_SUCCESS) return -1;
     log_file = fopen(FIFO_LOG, "a");
     if (log_file != NULL) {
         // Flush each line so logs are observable in real time while debugging.
@@ -212,110 +214,129 @@ int datamgr_parse_sensor_pipe(int input_fd, FILE *fp_sensor_map)
         int rc;
 
         rc = read_exact(input_fd, &measurement, sizeof(measurement));
-        if (rc == 0) break;
         if (rc < 0) {
             break;
         }
-
-        sensor = datamgr_get_sensor(measurement.sensor_id);
-        if (sensor == NULL) {
-            char buffer[160];
-
-            snprintf(
-                buffer,
-                sizeof(buffer),
-                "INVALID_SENSOR port=%d room=%hu sensor=%hu\n",
-                listen_port,
-                measurement.room_id,
-                measurement.sensor_id
-            );
-            write_log_message(log_file, buffer);
-            continue;
-        }
-        if (sensor->room_id != measurement.room_id) {
-            char buffer[192];
-
-            snprintf(
-                buffer,
-                sizeof(buffer),
-                "INVALID_PAIR port=%d sensor=%hu room=%hu expected_room=%hu\n",
-                listen_port,
-                measurement.sensor_id,
-                measurement.room_id,
-                sensor->room_id
-            );
-            write_log_message(log_file, buffer);
-            continue;
+        if (rc == 0) {
+            sbuffer_close(buffer);
+        } else if (sbuffer_insert(buffer, &measurement) == SBUFFER_FAILURE) {
+            break;
         }
 
-        sensor->value = measurement.value;
-        sensor->timestamp = measurement.timestamp;
-        update_running_average(sensor, measurement.value);
-        new_alert_state = ALERT_STATE_NORMAL;
-
-        if (sensor->sample_count >= RUN_AVG_LENGTH) {
-            char buffer[160];
-
-            if (sensor->RUN_AVG < SET_MIN_TEMP) {
-                new_alert_state = ALERT_STATE_COLD;
-            } else if (sensor->RUN_AVG > SET_MAX_TEMP) {
-                new_alert_state = ALERT_STATE_HOT;
+        while (true) {
+            rc = sbuffer_remove(buffer, &measurement);
+            if (rc == SBUFFER_NO_DATA) {
+                break;
+            }
+            if (rc == SBUFFER_CLOSED) {
+                goto datamgr_done;
+            }
+            if (rc != SBUFFER_SUCCESS) {
+                goto datamgr_done;
             }
 
-            /*
-             * Log only state transitions to avoid alert spam:
-             * NORMAL->HOT/COLD, HOT/COLD->NORMAL.
-             */
-            if (new_alert_state != sensor->alert_state) {
-                if (new_alert_state == ALERT_STATE_COLD) {
-                    snprintf(
-                        buffer,
-                        sizeof(buffer),
-                        "ALERT room=%hu sensor=%hu status=COLD avg=%.2f\n",
-                        sensor->room_id,
-                        sensor->sensor_id,
-                        sensor->RUN_AVG
-                    );
-                    write_log_message(log_file, buffer);
-                } else if (new_alert_state == ALERT_STATE_HOT) {
-                    snprintf(
-                        buffer,
-                        sizeof(buffer),
-                        "ALERT room=%hu sensor=%hu status=HOT avg=%.2f\n",
-                        sensor->room_id,
-                        sensor->sensor_id,
-                        sensor->RUN_AVG
-                    );
-                    write_log_message(log_file, buffer);
-                } else {
-                    snprintf(
-                        buffer,
-                        sizeof(buffer),
-                        "RECOVERY room=%hu sensor=%hu status=NORMAL avg=%.2f\n",
-                        sensor->room_id,
-                        sensor->sensor_id,
-                        sensor->RUN_AVG
-                    );
-                    write_log_message(log_file, buffer);
+            sensor = datamgr_get_sensor(measurement.sensor_id);
+            if (sensor == NULL) {
+                char buffer[160];
+
+                snprintf(
+                    buffer,
+                    sizeof(buffer),
+                    "INVALID_SENSOR port=%d room=%hu sensor=%hu\n",
+                    listen_port,
+                    measurement.room_id,
+                    measurement.sensor_id
+                );
+                write_log_message(log_file, buffer);
+                continue;
+            }
+            if (sensor->room_id != measurement.room_id) {
+                char buffer[192];
+
+                snprintf(
+                    buffer,
+                    sizeof(buffer),
+                    "INVALID_PAIR port=%d sensor=%hu room=%hu expected_room=%hu\n",
+                    listen_port,
+                    measurement.sensor_id,
+                    measurement.room_id,
+                    sensor->room_id
+                );
+                write_log_message(log_file, buffer);
+                continue;
+            }
+
+            sensor->value = measurement.value;
+            sensor->timestamp = measurement.timestamp;
+            update_running_average(sensor, measurement.value);
+            new_alert_state = ALERT_STATE_NORMAL;
+
+            if (sensor->sample_count >= RUN_AVG_LENGTH) {
+                char buffer[160];
+
+                if (sensor->RUN_AVG < SET_MIN_TEMP) {
+                    new_alert_state = ALERT_STATE_COLD;
+                } else if (sensor->RUN_AVG > SET_MAX_TEMP) {
+                    new_alert_state = ALERT_STATE_HOT;
+                }
+
+                /*
+                 * Log only state transitions to avoid alert spam:
+                 * NORMAL->HOT/COLD, HOT/COLD->NORMAL.
+                 */
+                if (new_alert_state != sensor->alert_state) {
+                    if (new_alert_state == ALERT_STATE_COLD) {
+                        snprintf(
+                            buffer,
+                            sizeof(buffer),
+                            "ALERT room=%hu sensor=%hu status=COLD avg=%.2f\n",
+                            sensor->room_id,
+                            sensor->sensor_id,
+                            sensor->RUN_AVG
+                        );
+                        write_log_message(log_file, buffer);
+                    } else if (new_alert_state == ALERT_STATE_HOT) {
+                        snprintf(
+                            buffer,
+                            sizeof(buffer),
+                            "ALERT room=%hu sensor=%hu status=HOT avg=%.2f\n",
+                            sensor->room_id,
+                            sensor->sensor_id,
+                            sensor->RUN_AVG
+                        );
+                        write_log_message(log_file, buffer);
+                    } else {
+                        snprintf(
+                            buffer,
+                            sizeof(buffer),
+                            "RECOVERY room=%hu sensor=%hu status=NORMAL avg=%.2f\n",
+                            sensor->room_id,
+                            sensor->sensor_id,
+                            sensor->RUN_AVG
+                        );
+                        write_log_message(log_file, buffer);
+                    }
                 }
             }
-        }
 
-        sensor->alert_state = new_alert_state;
-        write_data_log(log_file, sensor);
-        pending_data_lines++;
-        /* Periodic flush safeguard for long high-frequency runs. */
-        if (log_file != NULL && pending_data_lines >= 128) {
-            fflush(log_file);
-            pending_data_lines = 0;
+            sensor->alert_state = new_alert_state;
+            write_data_log(log_file, sensor);
+            pending_data_lines++;
+            /* Periodic flush safeguard for long high-frequency runs. */
+            if (log_file != NULL && pending_data_lines >= 128) {
+                fflush(log_file);
+                pending_data_lines = 0;
+            }
         }
     }
 
+datamgr_done:
     if (log_file != NULL) {
         fflush(log_file);
         write_log_message(log_file, "STOP receiver drained queue and exited\n");
         fclose(log_file);
     }
+    sbuffer_free(&buffer);
     return 0;
 }
 

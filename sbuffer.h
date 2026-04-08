@@ -30,7 +30,7 @@ int sbuffer_init(sbuffer_t **buffer);
 int sbuffer_free(sbuffer_t **buffer);
 
 /**
- * Closes the producer side of the queue and wakes up waiting consumers/producers.
+ * Closes the producer side of the queue.
  * \param buffer pointer to the queue
  * \return SBUFFER_SUCCESS on success and SBUFFER_FAILURE if an error occurred
  */
@@ -38,7 +38,7 @@ int sbuffer_close(sbuffer_t *buffer);
 
 /**
  * Removes the first sensor data in 'buffer' (at the 'head') and returns this sensor data as '*data'
- * If queue is empty and still open, the function blocks until data becomes available.
+ * If queue is empty and still open, SBUFFER_NO_DATA is returned.
  * If queue is closed and empty, SBUFFER_CLOSED is returned.
  * \param buffer a pointer to the buffer that is used
  * \param data a pointer to pre-allocated sensor_data_t space, the data will be copied into this structure. No new memory is allocated for 'data' in this function.

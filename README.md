@@ -4,6 +4,7 @@ This project simulates a sensor gateway system:
 - multiple TCP senders (`sensor_node`) push sensor measurements,
 - one receiver (`sensor_gateway`) accepts and validates data,
 - data is passed between dedicated child processes,
+- validated records are queued through `sbuffer` without using threads,
 - results are written into logs with running average and hot/cold alerts.
 
 The project is designed for multi-terminal debugging in VSCode or terminal.
@@ -29,7 +30,8 @@ flowchart LR
     MAP["room_sensor.map\n(room -> sensor)"] --> CM
     CM --> RAW["sensor_data_recv.txt\n(raw accepted data)"]
     CM --> PIPE["anonymous pipe\n(valid measurements only)"]
-    PIPE --> DM
+    PIPE --> SB["sbuffer\n(process-local queue,\nno pthread)"]
+    SB --> DM
     DM --> LOG["gateway.log\n(DATA / ALERT / RECOVERY / INVALID)"]
 ```
 
@@ -48,9 +50,15 @@ flowchart LR
 - `datamgr.c`
   - runs as a child process of `sensor_gateway`,
   - consumes measurements from the pipe,
+  - stages measurements in `sbuffer` before processing,
   - maintains running average (`RUN_AVG_LENGTH` window),
   - emits `ALERT`/`RECOVERY` logs when state changes,
   - writes normalized `DATA` lines to `gateway.log`.
+
+- `sbuffer.c`
+  - remains part of the project as a queue module,
+  - works without `pthread`,
+  - is used in the process-based pipeline instead of as a thread-safe queue.
 
 - `sensor_nodes.c`
   - sends `(sensor_id, room_id, value, timestamp)` to receiver,

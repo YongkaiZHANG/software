@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include "config.h"
 #include "lib/dplist.h"
+#include "sbuffer.h"
 
 #ifndef RUN_AVG_LENGTH
 #define RUN_AVG_LENGTH 5

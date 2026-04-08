@@ -2,7 +2,6 @@
 #include <time.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <pthread.h>
 #ifndef _CONFIG_H_
 #define _CONFIG_H_
 #define RUN_AVG_LENGTH 5
@@ -81,9 +80,6 @@ typedef struct sbuffer{
     size_t capacity;            /**< max number of pending items */
     bool closed;                /**< producer side closed flag */
     unsigned long long dropped_count;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
     time_t last_stamp;//to record the time of last processing
 }sbuffer_t;
 
