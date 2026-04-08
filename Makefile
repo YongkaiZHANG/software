@@ -6,8 +6,10 @@ TIMEOUT ?= 30
 SET_MIN_TEMP ?= 10
 SET_MAX_TEMP ?= 20
 HOST ?= 127.0.0.1
-ID ?= 1
+ROOM ?= 1
+SENSOR ?= 15
 SLEEP ?= 1
+LOOPS ?= 0
 
 CPPFLAGS_COMMON = -DSET_MIN_TEMP=$(SET_MIN_TEMP) -DSET_MAX_TEMP=$(SET_MAX_TEMP) -DTIMEOUT=$(TIMEOUT) -DPORT=$(PORT)
 CPPCHECK ?= cppcheck
@@ -69,7 +71,7 @@ lib/libtcpsock.so : lib/tcpsock.c
 .PHONY : all clean clean-all run run-multi zip
 
 clean:
-	rm -rf *.o sensor_gateway sensor_node file_creator *~
+	rm -rf *.o sensor_gateway sensor_node main sensor_nodes file_creator *~
 
 clean-all: clean
 	rm -rf lib/*.so
@@ -79,19 +81,22 @@ run : sensor_gateway sensor_node
 	@./sensor_gateway $(PORT) $(TIMEOUT) & \
 	gw=$$!; \
 	sleep 1; \
-	./sensor_node $(ID) $(SLEEP) $(HOST) $(PORT); \
+	./sensor_node $(ROOM) $(SENSOR) $(SLEEP) $(HOST) $(PORT) $(LOOPS); \
 	wait $$gw
 
 run-multi : sensor_gateway sensor_node
-	@echo "$(TITLE_COLOR)\n***** RUN sensor_gateway + sensor_node ID=1..4 *****$(NO_COLOR)"
+	@echo "$(TITLE_COLOR)\n***** RUN sensor_gateway + sensor_node room=1..4 *****$(NO_COLOR)"
 	@./sensor_gateway $(PORT) $(TIMEOUT) & \
 	gw=$$!; \
 	sleep 1; \
-	./sensor_node 1 $(SLEEP) $(HOST) $(PORT) & \
-	./sensor_node 2 $(SLEEP) $(HOST) $(PORT) & \
-	./sensor_node 3 $(SLEEP) $(HOST) $(PORT) & \
-	./sensor_node 4 $(SLEEP) $(HOST) $(PORT) & \
-	wait; \
+	./sensor_node 1 15 $(SLEEP) $(HOST) $(PORT) $(LOOPS) & s1=$$!; \
+	./sensor_node 2 21 $(SLEEP) $(HOST) $(PORT) $(LOOPS) & s2=$$!; \
+	./sensor_node 3 37 $(SLEEP) $(HOST) $(PORT) $(LOOPS) & s3=$$!; \
+	./sensor_node 4 49 $(SLEEP) $(HOST) $(PORT) $(LOOPS) & s4=$$!; \
+	wait $$s1; \
+	wait $$s2; \
+	wait $$s3; \
+	wait $$s4; \
 	wait $$gw
 
 zip:

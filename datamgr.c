@@ -99,8 +99,8 @@ static sensor_data_t *datamgr_get_sensor(sensor_id_t sensor_id)
 
 static int load_sensor_map(FILE *fp_sensor_map)
 {
-    sensor_id_t sensor_id;
     uint16_t room_id;
+    sensor_id_t sensor_id;
 
     if (fp_sensor_map == NULL) return -1;
 
@@ -111,7 +111,7 @@ static int load_sensor_map(FILE *fp_sensor_map)
     list = dpl_create(element_copy, element_free, element_compare);
     if (list == NULL) return -1;
 
-    while (fscanf(fp_sensor_map, "%hu %hu", &sensor_id, &room_id) == 2) {
+    while (fscanf(fp_sensor_map, "%hu %hu", &room_id, &sensor_id) == 2) {
         sensor_data_t sensor = {0};
 
         sensor.sensor_id = sensor_id;
@@ -152,6 +152,7 @@ static void update_running_average(sensor_data_t *sensor, sensor_value_t new_val
 void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
 {
     FILE *log_file;
+    size_t pending_data_lines = 0;
     char startup_msg[192];
 
     if (listen_port <= 0) {
@@ -166,8 +167,8 @@ void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
     if (load_sensor_map(fp_sensor_map) != 0) return;
     log_file = fopen(FIFO_LOG, "a");
     if (log_file != NULL) {
-        // Keep logging throughput stable under high-frequency sender traffic.
-        setvbuf(log_file, NULL, _IOFBF, 1024 * 1024);
+        // Flush each line so logs are observable in real time while debugging.
+        setvbuf(log_file, NULL, _IOLBF, 0);
         snprintf(
             startup_msg,
             sizeof(startup_msg),
@@ -194,14 +195,30 @@ void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
 
         sensor = datamgr_get_sensor(measurement.sensor_id);
         if (sensor == NULL) {
-            char buffer[128];
+            char buffer[160];
 
             snprintf(
                 buffer,
                 sizeof(buffer),
-                "INVALID port=%d sensor=%hu\n",
+                "INVALID_SENSOR port=%d room=%hu sensor=%hu\n",
                 listen_port,
+                measurement.room_id,
                 measurement.sensor_id
+            );
+            write_log_message(log_file, buffer);
+            continue;
+        }
+        if (sensor->room_id != measurement.room_id) {
+            char buffer[192];
+
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "INVALID_PAIR port=%d sensor=%hu room=%hu expected_room=%hu\n",
+                listen_port,
+                measurement.sensor_id,
+                measurement.room_id,
+                sensor->room_id
             );
             write_log_message(log_file, buffer);
             continue;
@@ -258,9 +275,15 @@ void datamgr_parse_sensor_sbuffer(sbuffer_t *sbuffer, FILE *fp_sensor_map)
 
         sensor->alert_state = new_alert_state;
         write_data_log(log_file, sensor);
+        pending_data_lines++;
+        if (log_file != NULL && pending_data_lines >= 128) {
+            fflush(log_file);
+            pending_data_lines = 0;
+        }
     }
 
     if (log_file != NULL) {
+        fflush(log_file);
         write_log_message(log_file, "STOP receiver drained queue and exited\n");
         fclose(log_file);
     }

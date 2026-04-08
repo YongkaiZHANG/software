@@ -13,7 +13,7 @@ typedef struct {
     int timeout_seconds;
 } app_context_t;
 
-static int parse_positive_int(const char *text, int min_value, int max_value)
+static int parse_int_in_range(const char *text, int min_value, int max_value)
 {
     char *endptr = NULL;
     long value;
@@ -35,7 +35,7 @@ static int parse_runtime_args(int argc, char *argv[], app_context_t *context)
     context->timeout_seconds = TIMEOUT;
 
     if (argc == 2) {
-        context->port = parse_positive_int(argv[1], 1, 65535);
+        context->port = parse_int_in_range(argv[1], 1, 65535);
         if (context->port < 0) {
             fprintf(stderr, "Invalid port: %s\n", argv[1]);
             fprintf(stderr, "Usage: %s [port] [idle_timeout_seconds]\n", argv[0]);
@@ -45,11 +45,12 @@ static int parse_runtime_args(int argc, char *argv[], app_context_t *context)
     }
 
     if (argc == 3) {
-        context->port = parse_positive_int(argv[1], 1, 65535);
-        context->timeout_seconds = parse_positive_int(argv[2], 1, 86400);
+        context->port = parse_int_in_range(argv[1], 1, 65535);
+        context->timeout_seconds = parse_int_in_range(argv[2], 0, 86400);
         if (context->port < 0 || context->timeout_seconds < 0) {
             fprintf(stderr, "Invalid arguments: port=%s timeout=%s\n", argv[1], argv[2]);
             fprintf(stderr, "Usage: %s [port] [idle_timeout_seconds]\n", argv[0]);
+            fprintf(stderr, "idle_timeout_seconds=0 means listen forever\n");
             return -1;
         }
         return 0;
